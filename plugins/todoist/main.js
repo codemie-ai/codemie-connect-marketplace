@@ -202,7 +202,11 @@ const NO_TOKEN = 'needs_token: Add your Todoist API token in Settings › Tasks.
 // The project's id, kept as {name, id} and found again when the project setting changes.
 const PROJECT_FILE = 'project.json';
 const PAGE = 200;
+// A list stops after this many pages (20,000 items).
 const MAX_PAGES = 100;
+// How long the project's open-task keys, listed once, answer `create`'s key lookup (ms): a copy
+// of 50 tasks lists the project once, not 50 times.
+const KEY_INDEX_MS = 60000;
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o ?? {}, k);
 
@@ -266,37 +270,103 @@ export function apply(ctx) {
     return out;
   }
 
-  // The project's id: kept in the store while the setting names the same project; otherwise
-  // found by name, and made once when Todoist has none by that name.
-  async function projectId() {
-    const name = projectName();
-    let kept = null;
+  // The kept project `{name, id}` while the setting still names it, else null.
+  function keptProject() {
     try {
-      kept = JSON.parse(ctx.store.read(PROJECT_FILE) ?? 'null');
+      const kept = JSON.parse(ctx.store.read(PROJECT_FILE) ?? 'null');
+      return kept?.name === projectName() && kept.id ? String(kept.id) : null;
     } catch {
-      kept = null;
+      return null;
     }
-    if (kept?.name === name && kept.id) return String(kept.id);
-    const found = (await paged('/projects')).find((p) => p.name === name);
+  }
+
+  // Whether Todoist no longer has project `id` open (deleted, or archived).
+  async function projectGone(id) {
+    try {
+      const p = await call('GET', `/projects/${encodeURIComponent(id)}`);
+      return Boolean(p?.is_archived || p?.is_deleted);
+    } catch (e) {
+      if (/^not_found:/.test(e.message)) return true;
+      throw e;
+    }
+  }
+
+  // Finds the named project (the first open one of that name), or makes it once when Todoist has
+  // none; keeps its id. Answers `{id, made}`.
+  async function findProject() {
+    const name = projectName();
+    const found = (await paged('/projects')).find((p) => p.name === name && !p.is_archived);
     const project = found ?? (await call('POST', '/projects', { json: { name } }));
     if (!project?.id) throw new Error('offline: Todoist answered without a project');
     const id = String(project.id);
     ctx.store.write(PROJECT_FILE, JSON.stringify({ name, id }));
-    return id;
+    keyIndex = null;
+    return { id, made: !found };
+  }
+
+  // The project's id: kept in the store while the setting names the same project; otherwise
+  // found by name, and made once when Todoist has none by that name.
+  async function projectId() {
+    return keptProject() ?? (await findProject()).id;
+  }
+
+  // Runs `work(pid)`; when it fails because the kept project is gone from Todoist (a 404 or a
+  // refusal while the project no longer answers), the project is found or made again and `work`
+  // runs once more there.
+  async function inProject(work) {
+    const pid = await projectId();
+    try {
+      return await work(pid);
+    } catch (e) {
+      if (!/^(not_found|refused):/.test(e.message) || !(await projectGone(pid))) throw e;
+      ctx.store.remove(PROJECT_FILE);
+      return work((await findProject()).id);
+    }
+  }
+
+  // `create`'s key lookup: the open tasks of the project by key, listed once and kept for a short
+  // while, learning from what this plugin makes and from each changedSince. Dropped whenever a
+  // create's answer is lost (Todoist may hold a task this index doesn't know).
+  let keyIndex = null; // {pid, at, byKey: Map<key, item>}
+  async function openByKey(pid) {
+    if (!keyIndex || keyIndex.pid !== pid || Date.now() - keyIndex.at > KEY_INDEX_MS) {
+      const byKey = new Map();
+      for (const item of await paged('/tasks', { project_id: pid })) {
+        const k = parseDescription(item.description).key;
+        if (k) byKey.set(k, item);
+      }
+      keyIndex = { pid, at: Date.now(), byKey };
+    }
+    return keyIndex.byKey;
+  }
+  function learn(item, pid) {
+    if (!keyIndex || keyIndex.pid !== pid) return;
+    const k = parseDescription(item.description).key;
+    if (!k) return;
+    if (item.checked || item.is_deleted || String(item.project_id) !== pid) keyIndex.byKey.delete(k);
+    else keyIndex.byKey.set(k, item);
   }
 
   const read = (item) => fromTodoist(item, { label: appLabel() });
   const taskPath = (id) => `/tasks/${encodeURIComponent(String(id))}`;
 
+  // Check: the account, and the kept project verified (a project deleted or archived in Todoist
+  // is found again by name, or made again once, and the answer says so).
   async function status() {
     const user = await call('GET', '/user');
-    await projectId();
-    return { ok: true, account: user?.full_name || user?.email || '', project: projectName() };
+    const answer = { ok: true, account: user?.full_name || user?.email || '', project: projectName() };
+    const kept = keptProject();
+    if (kept && !(await projectGone(kept))) return answer;
+    if (kept) ctx.store.remove(PROJECT_FILE);
+    const { made } = await findProject();
+    if (made && kept) {
+      answer.message = `Connect made the Todoist project “${projectName()}” again: the one it used is gone.`;
+    }
+    return answer;
   }
 
   async function list() {
-    const pid = await projectId();
-    return { tasks: (await paged('/tasks', { project_id: pid })).map(read) };
+    return inProject(async (pid) => ({ tasks: (await paged('/tasks', { project_id: pid })).map(read) }));
   }
 
   // What changed since `cursor` (null: everything open): the project's tasks only, done ones
@@ -310,6 +380,7 @@ export function apply(ctx) {
     const tasks = [];
     const removed = [];
     for (const item of answer?.items ?? []) {
+      learn(item, pid);
       if (String(item.project_id) !== pid) continue;
       if (item.is_deleted) {
         if (!full) removed.push(String(item.id));
@@ -323,14 +394,23 @@ export function apply(ctx) {
   // An open task of the project already holding `key` is adopted (a replayed create whose answer
   // was lost); only then is the task made, with the outbox entry's id as X-Request-Id.
   async function create({ key, task = {}, requestId } = {}) {
-    const pid = await projectId();
-    const open = await paged('/tasks', { project_id: pid });
-    const found = key ? open.find((item) => parseDescription(item.description).key === key) : null;
-    if (found) return { ...read(found), adopted: true };
-    const body = toTodoist({ ...task, key }, { projectId: pid, label: appLabel() });
-    // A new task with no date has none to clear.
-    if (body.due_string === 'no date') delete body.due_string;
-    return read(await call('POST', '/tasks', { json: body, requestId }));
+    return inProject(async (pid) => {
+      const found = key ? (await openByKey(pid)).get(key) : null;
+      if (found) return { ...read(found), adopted: true };
+      const body = toTodoist({ ...task, key }, { projectId: pid, label: appLabel() });
+      // A new task with no date has none to clear.
+      if (body.due_string === 'no date') delete body.due_string;
+      let made;
+      try {
+        made = await call('POST', '/tasks', { json: body, requestId });
+      } catch (e) {
+        // Todoist may have made it anyway: the next lookup lists the project again.
+        keyIndex = null;
+        throw e;
+      }
+      learn(made, pid);
+      return read(made);
+    });
   }
 
   // `patch` holds only the changed fields. The task is read first, so the description is rebuilt
@@ -355,10 +435,24 @@ export function apply(ctx) {
     return read(await call('POST', taskPath(id), { json: body, requestId }));
   }
 
-  // Closes the task, or reopens it with `done: false`; answers it as Todoist now has it.
+  // Closes the task, or reopens it with `done: false`; answers the whole task as Todoist now has
+  // it. A completed task may not be readable (404), so a close reads the open task first and
+  // answers it closed, and a reopen reads it once it is open again.
   async function complete({ id, done } = {}) {
-    await call('POST', `${taskPath(id)}/${done === false ? 'reopen' : 'close'}`);
-    return read(await call('GET', taskPath(id)));
+    if (done === false) {
+      await call('POST', `${taskPath(id)}/reopen`);
+      return read(await call('GET', taskPath(id)));
+    }
+    let before = null;
+    try {
+      before = await call('GET', taskPath(id));
+    } catch (e) {
+      if (!/^not_found:/.test(e.message)) throw e;
+    }
+    await call('POST', `${taskPath(id)}/close`);
+    // Already closed (and unreadable) before: read it now, or it is truly gone (not_found).
+    const item = before ?? (await call('GET', taskPath(id)));
+    return { ...read(item), done: true };
   }
 
   // Deletes the task; one already gone counts as removed.

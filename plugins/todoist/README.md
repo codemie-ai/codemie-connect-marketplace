@@ -47,6 +47,17 @@ again when it's read back.
 Dates are always an absolute day (`YYYY-MM-DD`); Connect never sends a recurring task's due string
 back, so its recurrence stays Todoist's.
 
+## Known behaviour
+
+- The project is checked on each Check: if it was deleted or archived in Todoist, the plugin
+  finds the open project of that name, or makes it once and says so.
+- Deleting a task Todoist no longer has counts as deleted.
+- A task moved to another Todoist project is no longer listed, but stays in Connect as last seen
+  (reporting it as deleted would delete it when moved back).
+- A task whose create answer was lost is found again by its key only while it is open in the
+  project; completed or moved in Todoist before Connect retried, it is made a second time.
+- Lists stop at 20,000 tasks.
+
 ## Changelog
 
 - 1.0.0: first version.

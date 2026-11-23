@@ -305,3 +305,112 @@ test('only api.todoist.com is fetched', async () => {
   assert.ok(urls.length > 8);
   for (const url of urls) assert.ok(url.startsWith('https://api.todoist.com/api/v1/'), url);
 });
+
+// ---------------------------------------------------------------- review fixes (round 1)
+
+test('status notices a deleted project and makes it again once, saying so', async () => {
+  const { run, fake, ctx } = setup();
+  await run('status', {});
+  const first = JSON.parse(ctx.store.read('project.json')).id;
+  fake.deleteProject(first);
+  const again = await run('status', {});
+  assert.equal(again.ok, true);
+  assert.equal(again.project, 'Connect');
+  assert.match(again.message, /made the Todoist project “Connect” again/);
+  const second = JSON.parse(ctx.store.read('project.json')).id;
+  assert.notEqual(second, first);
+  assert.equal(posts(fake, '/projects').length, 2);
+  const third = await run('status', {});
+  assert.equal(third.message, undefined);
+  assert.equal(posts(fake, '/projects').length, 2, 'made once');
+});
+
+test('status notices an archived project and finds or makes the named one', async () => {
+  const { run, fake, ctx } = setup();
+  await run('status', {});
+  fake.archiveProject(JSON.parse(ctx.store.read('project.json')).id);
+  const other = fake.addProjectAlways('Connect');
+  const again = await run('status', {});
+  assert.equal(again.message, undefined, 'found, not made');
+  assert.equal(JSON.parse(ctx.store.read('project.json')).id, other.id);
+});
+
+test('a create into a project deleted in Todoist finds the project again and is made there', async () => {
+  const { run, fake, ctx } = setup();
+  await run('status', {});
+  fake.deleteProject(JSON.parse(ctx.store.read('project.json')).id);
+  const made = await run('create', { key: 'k1', task: { text: 'After the delete', labels: [] }, requestId: 'r' });
+  const pid = JSON.parse(ctx.store.read('project.json')).id;
+  assert.equal(fake.task(made.id).project_id, pid);
+  assert.equal(posts(fake, '/projects').length, 2);
+});
+
+test('a refused create in a living project keeps the project', async () => {
+  const { run, fake } = setup();
+  await run('status', {});
+  fake.fail('POST /tasks', 400, { once: true });
+  await assert.rejects(run('create', { key: 'k', task: { text: 'x' } }), (e) => /^refused:/.test(e.message));
+  assert.equal(posts(fake, '/projects').length, 1);
+});
+
+test('duplicate project names: the first is used and none is made', async () => {
+  const { run, fake, ctx } = setup();
+  const a = fake.addProjectAlways('Connect');
+  fake.addProjectAlways('Connect');
+  await run('status', {});
+  assert.equal(posts(fake, '/projects').length, 0);
+  assert.equal(JSON.parse(ctx.store.read('project.json')).id, a.id);
+});
+
+test('complete succeeds when Todoist hides completed tasks from a read', async () => {
+  const { run, fake } = setup({ todoist: { hideCompleted: true } });
+  const t = await run('create', { key: 'k1', task: WAITING, requestId: 'r' });
+  const done = await run('complete', { id: t.id, done: true });
+  assert.equal(done.done, true);
+  assert.equal(done.text, WAITING.text, 'a full task, not a partial one');
+  assert.equal(done.key, 'k1');
+  assert.equal(fake.task(t.id).checked, true);
+  const open = await run('complete', { id: t.id, done: false });
+  assert.equal(open.done, false);
+  assert.equal(open.text, WAITING.text);
+});
+
+test('429 with retry_after only in the body', async () => {
+  const { run, fake } = setup();
+  await run('status', {});
+  fake.fail('GET /tasks', 429, { once: true, body: { error: 'Too many requests', error_extra: { retry_after: 7 } } });
+  await assert.rejects(run('list', {}), (e) => /^rate_limited:7:/.test(e.message));
+  fake.fail('GET /tasks', 429, { once: true, retryAfter: 9 });
+  const res = await fake.handler('https://api.todoist.com/api/v1/tasks', { headers: { Authorization: `Bearer ${SENTINEL}` } });
+  assert.equal(res.headers['retry-after'], '9');
+  assert.equal(JSON.parse(res.body).error_extra.retry_after, 9, 'the fake sends both, as Todoist may');
+});
+
+test('copying 50 tasks makes at most 50 creates plus a few lookups', async () => {
+  const { run, fake } = setup({ todoist: { pageSize: 200 } });
+  for (let n = 0; n < 300; n += 1) {
+    await run('create', { key: `old${n}`, task: { text: `Old ${n}`, labels: [] }, requestId: `o${n}` });
+  }
+  const before = fake.requests.length;
+  for (let n = 0; n < 50; n += 1) {
+    await run('create', { key: `new${n}`, task: { text: `New ${n}`, labels: [] }, requestId: `n${n}` });
+  }
+  const used = fake.requests.length - before;
+  assert.ok(used <= 50 + 3, `${used} requests for 50 creates`);
+  assert.equal(fake.all().length, 350);
+});
+
+test('the key index learns from changedSince, so a task made elsewhere is adopted', async () => {
+  const { run, fake } = setup();
+  await run('create', { key: 'k0', task: { text: 'Warm the index', labels: [] }, requestId: 'r0' });
+  const { cursor } = await run('changedSince', { cursor: null });
+  // Made by another device with the same key, after the index was built.
+  const other = await fake.handler('https://api.todoist.com/api/v1/tasks', {
+    method: 'POST', headers: { Authorization: `Bearer ${SENTINEL}` },
+    body: JSON.stringify({ content: 'Same', description: 'key: k9', project_id: fake.all()[0].project_id }),
+  });
+  await run('changedSince', { cursor });
+  const again = await run('create', { key: 'k9', task: { text: 'Same', labels: [] }, requestId: 'r9' });
+  assert.equal(again.adopted, true);
+  assert.equal(again.id, JSON.parse(other.body).id);
+});
