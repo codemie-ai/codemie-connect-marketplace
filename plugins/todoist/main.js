@@ -66,7 +66,8 @@ export function describe({ notes, key, source, meetingId, owner } = {}) {
   if (meetingId) markers.push(`meeting: ${meetingId}`);
   const owl = ownerLine(owner);
   if (owl) markers.push(`owner: ${owl}`);
-  return markers.length ? [body, '', ...markers].join('\n') : body;
+  if (!markers.length) return body;
+  return body ? [body, '', ...markers].join('\n') : markers.join('\n');
 }
 
 // The inverse of describe(): the notes (every marker-looking line dropped) plus the last marker
@@ -106,8 +107,13 @@ export function toTodoist(task = {}, { projectId, label } = {}) {
   }
 
   if (task.kind !== undefined || task.labels !== undefined || label !== undefined) {
-    const kept = (task.labels ?? []).filter((l) => l !== label && !KIND_LABELS.includes(l));
-    const kindLabel = LABEL_OF_KIND[task.kind];
+    const given = task.labels ?? [];
+    const kept = given.filter((l) => l !== label && !KIND_LABELS.includes(l));
+    // kind given -> its label (or none, for a plain task); kind omitted (unchanged) -> whichever
+    // kind label the given labels already carried, so a labels-only patch never erases it.
+    const kindLabel = task.kind !== undefined
+      ? LABEL_OF_KIND[task.kind]
+      : KIND_LABELS.find((l) => given.includes(l));
     body.labels = [...new Set([...kept, label, kindLabel].filter(Boolean))];
   }
 
@@ -178,7 +184,7 @@ export function errorOf(status, headers = {}, bodyText = '') {
     return new Error('not_found: the Todoist task is gone');
   }
   if (status >= 500 || !status) {
-    return new Error(`offline: Todoist is unreachable (${status})`);
+    return new Error(status ? `offline: Todoist is unreachable (${status})` : 'offline: Todoist is unreachable');
   }
   return new Error(`refused: Todoist didn't accept the change (${status})`);
 }

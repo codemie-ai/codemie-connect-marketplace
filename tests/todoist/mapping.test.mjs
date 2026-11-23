@@ -48,6 +48,23 @@ test('describe writes an owner line as "owner: Name <address>"', () => {
   assert.equal(desc, 'Ping them\n\nkey: k1\nowner: Marek Novak <marek.novak@example.test>');
 });
 
+test('describe with markers but no notes has no leading blank line', () => {
+  const desc = describe({ key: 'k1', owner: { name: 'Marek Novak', address: 'm@x.test' } });
+  assert.equal(desc, 'key: k1\nowner: Marek Novak <m@x.test>');
+  assert.deepEqual(parseDescription(desc), {
+    notes: '',
+    key: 'k1',
+    source: undefined,
+    meetingId: undefined,
+    owner: { name: 'Marek Novak', address: 'm@x.test' },
+  });
+});
+
+test('describe with notes and markers keeps exactly one blank line between them', () => {
+  const desc = describe({ notes: 'Quote', key: 'k1' });
+  assert.equal(desc, 'Quote\n\nkey: k1');
+});
+
 test('parseDescription takes the last marker of each kind', () => {
   const desc = [
     'The quote.',
@@ -153,6 +170,26 @@ test('labels: app label and kind added, foreign labels kept, kind read back (bud
   assert.equal(plain.kind, 'task');
 });
 
+test('a labels-only patch keeps whichever kind label is already in the given labels', () => {
+  const body = toTodoist({ labels: ['home', 'waiting'] }, { projectId: 'p1', label: 'connect' });
+  assert.deepEqual(new Set(body.labels), new Set(['home', 'connect', 'waiting']));
+});
+
+test('a kind-only patch sets the kind label even with no labels field', () => {
+  const body = toTodoist({ kind: 'reply' }, { projectId: 'p1', label: 'connect' });
+  assert.deepEqual(new Set(body.labels), new Set(['connect', 'reply']));
+});
+
+test('a patch with both kind and labels uses the given kind, not whatever was in labels', () => {
+  const body = toTodoist({ kind: 'budget', labels: ['home'] }, { projectId: 'p1', label: 'connect' });
+  assert.deepEqual(new Set(body.labels), new Set(['home', 'connect', 'budget']));
+});
+
+test('explicitly changing kind to a plain task drops the old kind label, even without a fresh labels field', () => {
+  const body = toTodoist({ kind: 'task', labels: ['waiting', 'home'] }, { projectId: 'p1', label: 'connect' });
+  assert.deepEqual(new Set(body.labels), new Set(['home', 'connect']));
+});
+
 test('due dates are absolute days; null clears; words are refused', () => {
   const withDate = toTodoist({ text: 'x', due: '2026-11-20' }, { projectId: 'p1', label: 'connect' });
   assert.equal(withDate.due_date, '2026-11-20');
@@ -195,6 +232,7 @@ test('errors map to codes and carry no body or token', () => {
   assert.match(errorOf(429, {}, '').message, /^rate_limited:60:/);
 
   assert.match(errorOf(503).message, /^offline:/);
+  assert.match(errorOf(undefined).message, /^offline:/); // a network failure: no status at all
   assert.match(errorOf(404).message, /^not_found:/);
 
   const refused = errorOf(400, {}, `{"error": "bad request", "token": "${SENTINEL}"}`);
