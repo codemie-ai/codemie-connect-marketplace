@@ -1,0 +1,19 @@
+{
+  "id": "todoist",
+  "name": "Todoist",
+  "version": "1.0.0",
+  "engine": ">=1.0",
+  "requires": ["tasks_provider"],
+  "provides": ["tasks"],
+  "main": "main.js",
+  "icon": "icon.svg",
+  "summary": "Keeps Connect's tasks in your Todoist: one project, consistent labels, no duplicates",
+  "uses": {
+    "network": { "hosts": ["api.todoist.com"] }
+  },
+  "settings": [
+    { "key": "token", "label": "API token", "type": "secret", "help": "Todoist › Settings › Integrations › Developer" },
+    { "key": "project", "label": "Project", "type": "string", "default": "Connect" },
+    { "key": "label", "label": "App label", "type": "string", "default": "connect" }
+  ]
+}
