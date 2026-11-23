@@ -1,6 +1,8 @@
 {
   "name": "codemie",
   "owner": "codemie-ai",
-  "featured": [],
-  "plugins": []
+  "featured": ["todoist"],
+  "plugins": [
+    { "id": "todoist", "source": "./plugins/todoist", "categories": ["tasks"] }
+  ]
 }

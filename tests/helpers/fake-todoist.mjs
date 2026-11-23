@@ -4,16 +4,19 @@
 // passed straight to fakeCtx({ fetchHandler: fakeTodoist(...).handler }).
 //
 // Covers what the Todoist plugin uses: GET /user, GET|POST /projects, GET|POST /tasks,
-// POST /tasks/{id}, /tasks/{id}/close, /tasks/{id}/reopen, DELETE /tasks/{id}, and POST /sync
-// with sync tokens. Also a bearer-token check, a request log, and failure injection (`fail`).
+// GET|POST /tasks/{id}, /tasks/{id}/close, /tasks/{id}/reopen (204), DELETE /tasks/{id}, and
+// POST /sync with sync tokens (form or JSON body). Lists are paged (`pageSize`, `next_cursor`).
+// Also a bearer-token check, a request log, failure injection (`fail`) and a lost answer (`lose`:
+// the work is done, then the call fails as if the connection dropped).
 
 const BASE = 'https://api.todoist.com/api/v1';
 
-export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', email: 'you@example.test', full_name: 'You' } } = {}) {
+export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', email: 'you@example.test', full_name: 'You' }, pageSize = 200 } = {}) {
   const projects = new Map(); // id -> {id, name}
   const tasks = new Map(); // id -> Todoist task record (+ internal _rev, _deleted)
   const requests = []; // {method, path, body}
   const failures = new Map(); // "METHOD /path" or "/path" -> {status, retryAfter, body, once}
+  const losing = new Set(); // "METHOD /path": the next such call is done, then its answer is lost
   let nextId = 1;
   let rev = 0;
 
@@ -41,6 +44,25 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
     return null;
   }
 
+  // One page of `items` from `cursor` (an index), with the next cursor or null.
+  function page(items, cursor) {
+    const from = Number(cursor) || 0;
+    const next = from + pageSize < items.length ? String(from + pageSize) : null;
+    return { results: items.slice(from, from + pageSize), next_cursor: next };
+  }
+
+  // A /sync body: form-encoded (`sync_token=*&resource_types=["items"]`) or JSON.
+  function syncArgs(body) {
+    if (!body) return {};
+    if (body.trim().startsWith('{')) return JSON.parse(body);
+    const out = {};
+    for (const pair of body.split('&')) {
+      const [k, v = ''] = pair.split('=');
+      out[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' '));
+    }
+    return out;
+  }
+
   function respond(status, body, headers = {}) {
     return { status, headers, body: typeof body === 'string' ? body : JSON.stringify(body) };
   }
@@ -66,7 +88,15 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
     return null;
   }
 
-  async function handler(url, { method = 'GET', headers = {}, body } = {}) {
+  async function handler(url, opts = {}) {
+    const answer = await serve(url, opts);
+    const u = new URL(url);
+    const key = `${opts.method ?? 'GET'} ${u.pathname.replace(/^\/api\/v1/, '')}`;
+    if (losing.delete(key)) throw new Error('couldn\'t reach api.todoist.com: connection closed (a test)');
+    return answer;
+  }
+
+  async function serve(url, { method = 'GET', headers = {}, body } = {}) {
     const u = new URL(url);
     const path = u.pathname.startsWith('/api/v1') ? u.pathname.slice('/api/v1'.length) : u.pathname;
     requests.push({ method, path: `${path}${u.search}`, body: body ?? null });
@@ -80,7 +110,7 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
       return respond(forced.status, forced.body ?? { error: 'forced failure (test)' }, respHeaders);
     }
 
-    const data = body ? JSON.parse(body) : {};
+    const data = path === '/sync' ? syncArgs(body) : body ? JSON.parse(body) : {};
     const now = new Date().toISOString();
 
     if (method === 'GET' && path === '/user') {
@@ -88,7 +118,7 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
     }
 
     if (method === 'GET' && path === '/projects') {
-      return respond(200, { results: [...projects.values()], next_cursor: null });
+      return respond(200, page([...projects.values()], u.searchParams.get('cursor')));
     }
     if (method === 'POST' && path === '/projects') {
       if (findProjectByName(data.name)) return respond(400, { error: 'project already exists' });
@@ -101,7 +131,7 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
       const projectId = u.searchParams.get('project_id');
       const open = [...tasks.values()].filter((t) => !t.checked && !t._deleted
         && (projectId == null || t.project_id === projectId));
-      return respond(200, { results: open.map(taskView), next_cursor: null });
+      return respond(200, page(open.map(taskView), u.searchParams.get('cursor')));
     }
     if (method === 'POST' && path === '/tasks') {
       const t = bump({
@@ -123,6 +153,11 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
     }
 
     const taskMatch = /^\/tasks\/([^/]+)(\/(close|reopen))?$/.exec(path);
+    if (taskMatch && method === 'GET' && !taskMatch[3]) {
+      const t = tasks.get(taskMatch[1]);
+      if (!t || t._deleted) return respond(404, { error: 'task not found' });
+      return respond(200, taskView(t));
+    }
     if (taskMatch && method === 'POST') {
       const [, id, , action] = taskMatch;
       const t = tasks.get(id);
@@ -141,7 +176,7 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
       }
       t.updated_at = now;
       bump(t);
-      return respond(200, taskView(t));
+      return action ? respond(204, '') : respond(200, taskView(t));
     }
     if (taskMatch && method === 'DELETE') {
       const [, id] = taskMatch;
@@ -168,7 +203,18 @@ export function fakeTodoist({ token = 'fake-todoist-token', user = { id: 'u1', e
     handler,
     fail,
     clearFailure,
+    // The next `METHOD /path` call is done, but its answer never arrives.
+    lose: (key) => losing.add(key),
     requests,
+    // A change made in Todoist itself: `fields` (a task's Todoist fields) merged into task `id`.
+    edit: (id, fields) => {
+      const t = tasks.get(id);
+      Object.assign(t, fields, { updated_at: new Date().toISOString() });
+      bump(t);
+      return taskView(t);
+    },
+    // All tasks, open, done and deleted, as Todoist shows them.
+    all: () => [...tasks.values()].map(taskView),
     // Test setup helpers: seed a project directly (as if it already existed in Todoist).
     addProject: (name) => {
       const existing = findProjectByName(name);

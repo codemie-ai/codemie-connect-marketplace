@@ -1,5 +1,5 @@
 // The Todoist plugin's mapping: marker lines, labels, owners, dates and errors. Pure functions
-// only (main.js's apply(ctx) is wired up in Task 6) — no network, no fake Todoist needed here.
+// only (main.js's apply(ctx) is tested in provider.test.mjs) — no network, no fake Todoist needed here.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

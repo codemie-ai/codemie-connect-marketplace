@@ -1,8 +1,8 @@
 // Todoist task provider for Connect. Host half only (no client half, no imports — the host loads
-// this one script). This file holds the pure mapping between Connect's task shape and Todoist's:
-// the marker lines in the description, labels, the owner prefix, due dates and error codes.
-// `apply(ctx)` (reading settings, calling the Todoist API, registering `ctx.tasks.provide`) is
-// added in a later step; everything below has no side effect and no network access.
+// this one script). The first part is the pure mapping between Connect's task shape and
+// Todoist's: the marker lines in the description, labels, the owner prefix, due dates and error
+// codes. `apply(ctx)` at the end registers the seven provider ops with `ctx.tasks.provide`; they
+// call https://api.todoist.com/api/v1 with the token read from the settings on every call.
 
 // The marker-line rule: any line that merely *looks* like one of Connect's marker lines (any
 // case, Markdown-decorated: "**Source:** …", "> key: …") is dropped from free text before it is
@@ -50,11 +50,16 @@ function lastMatch(text, re) {
 // keeps just the name.
 function parseOwnerLine(raw) {
   const m = /^(.*?)\s*<([^>]*)>\s*$/.exec(raw);
-  return m ? { name: m[1], address: m[2] } : { name: raw };
+  return m ? { name: m[1] || null, address: m[2] } : { name: raw };
 }
 
-const ownerLine = (owner) =>
-  owner?.address ? `${owner.name} <${owner.address}>` : owner?.name ? `${owner.name}` : null;
+// "Name <address>", "<address>" with no name, "Name" with no address; null with neither.
+function ownerLine(owner) {
+  const name = String(owner?.name ?? '').trim();
+  const address = String(owner?.address ?? '').trim();
+  if (address) return name ? `${name} <${address}>` : `<${address}>`;
+  return name || null;
+}
 
 // The notes without marker-looking lines, a blank line, then Connect's own marker lines (last),
 // one per line, each only when present: key, source (https only), meeting, owner.
@@ -187,4 +192,184 @@ export function errorOf(status, headers = {}, bodyText = '') {
     return new Error(status ? `offline: Todoist is unreachable (${status})` : 'offline: Todoist is unreachable');
   }
   return new Error(`refused: Todoist didn't accept the change (${status})`);
+}
+
+// ------------------------------------------------------------------------------------------------
+// The provider ops (design §5's table), registered with `ctx.tasks.provide`.
+
+const API = 'https://api.todoist.com/api/v1';
+const NO_TOKEN = 'needs_token: Add your Todoist API token in Settings › Tasks.';
+// The project's id, kept as {name, id} and found again when the project setting changes.
+const PROJECT_FILE = 'project.json';
+const PAGE = 200;
+const MAX_PAGES = 100;
+
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o ?? {}, k);
+
+// `{a: 1, b: 'x y'}` -> "a=1&b=x%20y" (QuickJS has no URLSearchParams).
+const formOf = (fields) =>
+  Object.entries(fields)
+    .filter(([, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
+
+export function apply(ctx) {
+  const setting = (key, fallback) => {
+    const v = ctx.settings.get(key);
+    return typeof v === 'string' && v.trim() ? v.trim() : fallback;
+  };
+  const appLabel = () => setting('label', 'connect');
+  const projectName = () => setting('project', 'Connect');
+
+  // One Todoist call. The token is read here, on every call, and kept nowhere else; a failure
+  // becomes a coded Error whose message never holds the token or the response body.
+  async function call(method, path, { json, form, requestId } = {}) {
+    const token = setting('token', null);
+    if (!token) throw new Error(NO_TOKEN);
+    const headers = { Authorization: `Bearer ${token}` };
+    const opts = { method, headers };
+    if (form) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      opts.body = formOf(form);
+    } else if (json !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(json);
+    }
+    if (requestId) headers['X-Request-Id'] = String(requestId);
+    let res;
+    try {
+      res = await ctx.http.fetch(`${API}${path}`, opts);
+    } catch {
+      // The host couldn't reach Todoist, or it didn't answer in time.
+      throw errorOf(undefined);
+    }
+    const status = Number(res?.status);
+    if (!(status >= 200 && status < 300)) throw errorOf(status, res?.headers, res?.body);
+    if (!res.body) return null;
+    try {
+      return JSON.parse(res.body);
+    } catch {
+      throw new Error("offline: Todoist's answer couldn't be read");
+    }
+  }
+
+  // Every item of a paged list (`{results, next_cursor}`).
+  async function paged(path, query = {}) {
+    const out = [];
+    let cursor = null;
+    for (let i = 0; i < MAX_PAGES; i += 1) {
+      const page = await call('GET', `${path}?${formOf({ ...query, limit: PAGE, cursor })}`);
+      out.push(...(page?.results ?? []));
+      cursor = page?.next_cursor ?? null;
+      if (!cursor) break;
+    }
+    return out;
+  }
+
+  // The project's id: kept in the store while the setting names the same project; otherwise
+  // found by name, and made once when Todoist has none by that name.
+  async function projectId() {
+    const name = projectName();
+    let kept = null;
+    try {
+      kept = JSON.parse(ctx.store.read(PROJECT_FILE) ?? 'null');
+    } catch {
+      kept = null;
+    }
+    if (kept?.name === name && kept.id) return String(kept.id);
+    const found = (await paged('/projects')).find((p) => p.name === name);
+    const project = found ?? (await call('POST', '/projects', { json: { name } }));
+    if (!project?.id) throw new Error('offline: Todoist answered without a project');
+    const id = String(project.id);
+    ctx.store.write(PROJECT_FILE, JSON.stringify({ name, id }));
+    return id;
+  }
+
+  const read = (item) => fromTodoist(item, { label: appLabel() });
+  const taskPath = (id) => `/tasks/${encodeURIComponent(String(id))}`;
+
+  async function status() {
+    const user = await call('GET', '/user');
+    await projectId();
+    return { ok: true, account: user?.full_name || user?.email || '', project: projectName() };
+  }
+
+  async function list() {
+    const pid = await projectId();
+    return { tasks: (await paged('/tasks', { project_id: pid })).map(read) };
+  }
+
+  // What changed since `cursor` (null: everything open): the project's tasks only, done ones
+  // included, and the ids deleted in Todoist. A task moved to another project is left out.
+  async function changedSince({ cursor = null } = {}) {
+    const pid = await projectId();
+    const full = !cursor;
+    const answer = await call('POST', '/sync', {
+      form: { sync_token: cursor ?? '*', resource_types: JSON.stringify(['items']) },
+    });
+    const tasks = [];
+    const removed = [];
+    for (const item of answer?.items ?? []) {
+      if (String(item.project_id) !== pid) continue;
+      if (item.is_deleted) {
+        if (!full) removed.push(String(item.id));
+      } else if (!(full && item.checked)) {
+        tasks.push(read(item));
+      }
+    }
+    return { tasks, removed, cursor: answer?.sync_token ?? cursor };
+  }
+
+  // An open task of the project already holding `key` is adopted (a replayed create whose answer
+  // was lost); only then is the task made, with the outbox entry's id as X-Request-Id.
+  async function create({ key, task = {}, requestId } = {}) {
+    const pid = await projectId();
+    const open = await paged('/tasks', { project_id: pid });
+    const found = key ? open.find((item) => parseDescription(item.description).key === key) : null;
+    if (found) return { ...read(found), adopted: true };
+    const body = toTodoist({ ...task, key }, { projectId: pid, label: appLabel() });
+    // A new task with no date has none to clear.
+    if (body.due_string === 'no date') delete body.due_string;
+    return read(await call('POST', '/tasks', { json: body, requestId }));
+  }
+
+  // `patch` holds only the changed fields. The task is read first, so the description is rebuilt
+  // with its marker lines, the content keeps or drops the owner prefix, and labels Connect doesn't
+  // own are kept; a field the patch doesn't name is never sent (a recurring due string stays).
+  async function update({ id, patch = {}, requestId } = {}) {
+    const current = read(await call('GET', taskPath(id)));
+    const has = (k) => hasOwn(patch, k);
+    const merged = { ...current, ...patch };
+    if (!has('due')) delete merged.due;
+    if (!has('labels')) merged.labels = current.labels;
+    const full = toTodoist(merged, { label: appLabel() });
+    const body = {};
+    if (has('text') || has('kind') || has('owner')) body.content = full.content;
+    if (has('notes') || has('owner')) body.description = full.description;
+    if (has('kind') || has('labels')) body.labels = full.labels;
+    if (has('due')) {
+      if (hasOwn(full, 'due_date')) body.due_date = full.due_date;
+      if (hasOwn(full, 'due_string')) body.due_string = full.due_string;
+    }
+    if (!Object.keys(body).length) return current;
+    return read(await call('POST', taskPath(id), { json: body, requestId }));
+  }
+
+  // Closes the task, or reopens it with `done: false`; answers it as Todoist now has it.
+  async function complete({ id, done } = {}) {
+    await call('POST', `${taskPath(id)}/${done === false ? 'reopen' : 'close'}`);
+    return read(await call('GET', taskPath(id)));
+  }
+
+  // Deletes the task; one already gone counts as removed.
+  async function remove({ id } = {}) {
+    try {
+      await call('DELETE', taskPath(id));
+    } catch (e) {
+      if (!/^not_found:/.test(e.message)) throw e;
+    }
+    return { removed: true };
+  }
+
+  ctx.tasks.provide({ status, list, changedSince, create, update, complete, remove });
 }
