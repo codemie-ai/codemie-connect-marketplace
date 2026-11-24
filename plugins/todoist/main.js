@@ -455,12 +455,16 @@ export function apply(ctx) {
     return { ...read(item), done: true };
   }
 
-  // Deletes the task; one already gone counts as removed.
+  // Deletes the task; one already gone counts as removed. Its key leaves the create lookup, so an
+  // add of the same key right after (Undo, then add again) makes a new task, never the deleted one.
   async function remove({ id } = {}) {
     try {
       await call('DELETE', taskPath(id));
     } catch (e) {
       if (!/^not_found:/.test(e.message)) throw e;
+    }
+    for (const [k, item] of keyIndex?.byKey ?? []) {
+      if (String(item.id) === String(id)) keyIndex.byKey.delete(k);
     }
     return { removed: true };
   }

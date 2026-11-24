@@ -145,6 +145,17 @@ test('a create whose answer was lost is adopted on replay', async () => {
   assert.equal(fake.all().length, 1, 'and holds exactly one');
 });
 
+test('add, remove, add again in quick succession makes a new task, never the deleted one', async () => {
+  const { run, fake } = setup();
+  const first = await run('create', { key: 'k1', task: { text: 'Send the list', labels: [] }, requestId: 'a' });
+  assert.deepEqual(await run('remove', { id: first.id }), { removed: true });
+  const again = await run('create', { key: 'k1', task: { text: 'Send the list', labels: [] }, requestId: 'b' });
+  assert.notEqual(again.id, first.id, 'the deleted task is not adopted');
+  assert.notEqual(again.adopted, true);
+  assert.equal(fake.task(again.id).is_deleted, false);
+  assert.equal((await run('list', {})).tasks.length, 1, 'one open task in Todoist');
+});
+
 test('list answers every open task of the project, paged', async () => {
   const { run, fake } = setup({ todoist: { pageSize: 2 } });
   for (const n of [1, 2, 3, 4, 5]) await run('create', { key: `k${n}`, task: { text: `T${n}`, labels: [] }, requestId: `r${n}` });

@@ -53,11 +53,17 @@ back, so its recurrence stays Todoist's.
   finds the open project of that name, or makes it once and says so.
 - Deleting a task Todoist no longer has counts as deleted.
 - A task moved to another Todoist project is no longer listed, but stays in Connect as last seen
-  (reporting it as deleted would delete it when moved back).
+  (reporting it as deleted would delete it when moved back) until Connect next reads the whole
+  project (a switch, Check, or a changed setting), which drops it from Connect only.
+- The key lookup that stops duplicates lists the project's open tasks once and keeps that list
+  for 60 seconds. A task with the same key made in that window somewhere else (Connect on another
+  Mac, say) isn't in the list, so a create then makes a second task.
 - A task whose create answer was lost is found again by its key only while it is open in the
   project; completed or moved in Todoist before Connect retried, it is made a second time.
 - Lists stop at 20,000 tasks.
 
 ## Changelog
 
+- 1.0.1: a task added again right after it was removed (Undo, then add) is made anew, never
+  matched to the deleted one.
 - 1.0.0: first version.
