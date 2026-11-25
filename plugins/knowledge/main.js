@@ -150,9 +150,17 @@ export function sectionsOf(text) {
   return sections.map((s) => ({ heading: s.heading, text: s.lines.join('\n').trim() }));
 }
 
+const H1_RE = /^#\s+(.+?)\s*$/m;
+
 function h1Of(body) {
-  const m = /^#\s+(.+?)\s*$/m.exec(body);
+  const m = H1_RE.exec(body);
   return m ? m[1].trim() : null;
+}
+
+// The index of the line `h1Of` reads the title from (`-1` when there is none).
+function h1LineOf(text) {
+  const m = H1_RE.exec(text);
+  return m ? text.slice(0, m.index).split('\n').length - 1 : -1;
 }
 
 // `[[Page]]` -> "Page"; `[[Page|label]]` -> "label": a link reads as text, never as Markdown.
@@ -834,11 +842,15 @@ export function snippetOf(page, terms) {
   const title = cutChars(h1 || titleCaseOf(slug(baseNameOf(page?.path ?? ''))), 120);
   const termsFolded = (terms ?? []).map(foldText).filter(Boolean);
   const sections = sectionsOf(body);
-  const lines = stripLinks(body).split(/\r\n|\n/);
+  const stripped = stripLinks(body);
+  const lines = stripped.split(/\r\n|\n/);
+  // Only the very line the title came from is skipped: a second "# " line, or one inside a code
+  // fence, is ordinary text.
+  const titleLine = h1LineOf(stripped);
   let heading = null;
   let lastEmitted = null;
   const out = [];
-  for (const rawLine of lines) {
+  for (const [i, rawLine] of lines.entries()) {
     const h = /^##\s+(.+?)\s*$/.exec(rawLine);
     if (h) {
       heading = h[1].trim();
@@ -846,7 +858,7 @@ export function snippetOf(page, terms) {
     }
     const line = rawLine.trim();
     // The "# " title is the fact's `title`, never a line of its text.
-    if (!line || /^#\s/.test(line)) continue;
+    if (!line || i === titleLine) continue;
     const folded = foldText(line);
     if (termsFolded.some((t) => wordIncludes(folded, t))) {
       if (heading && heading !== lastEmitted) {

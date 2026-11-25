@@ -145,6 +145,29 @@ test('snippetOf never gives the "# " title as the text of an H1-only match', () 
   assert.ok(snip.text.includes('Go-live moved to 2026-12-08.'), snip.text);
 });
 
+// Review (task 13): only the very line used as the title is skipped — a second "# " line, or a
+// "# " line inside a code fence, is ordinary text that can hold a term.
+test('snippetOf skips only the title line: a second H1 or a "# " line in a code fence still counts', () => {
+  const page = {
+    path: 'projects/atlas.md',
+    text: ['# Atlas Rollout', '', '```', '# Atlas Rollout deploy script', '```', '', '# Atlas Rollout retro', 'Went well.'].join('\n'),
+  };
+  const snip = snippetOf(page, ['Atlas Rollout']);
+  assert.equal(snip.title, 'Atlas Rollout');
+  const lines = snip.text.split('\n');
+  assert.ok(lines.includes('# Atlas Rollout deploy script'), snip.text);
+  assert.ok(lines.includes('# Atlas Rollout retro'), snip.text);
+  assert.ok(!lines.includes('# Atlas Rollout'), snip.text);
+
+  const fenceFirst = {
+    path: 'notes/ops.md',
+    text: ['```', '# Atlas Rollout check', '```', 'Run it before go-live.'].join('\n'),
+  };
+  const fenced = snippetOf(fenceFirst, ['Atlas Rollout']);
+  assert.equal(fenced.title, 'Atlas Rollout check', 'h1Of reads the fenced line as the title');
+  assert.ok(!fenced.text.split('\n').includes('# Atlas Rollout check'), fenced.text);
+});
+
 // Review I3's own suggested fix: when a page truly has no text to give (an alias-only match on
 // an otherwise-empty page), it is skipped rather than handed back as an empty fact — a
 // lower-ranked, populated page takes its slot instead.
