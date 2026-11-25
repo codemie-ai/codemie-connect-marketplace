@@ -410,3 +410,8 @@ test('the walk skips the configured Voice folder, whatever its name', () => {
   assert.equal(walkable('voice/memo.md', 'MyVoice'), true, 'only the configured folder is skipped');
   assert.equal(walkable('Voice/style.md'), false, 'the default is Voice');
 });
+
+test('a folded block scalar that starts with a blank line keeps no leading break', () => {
+  const { front } = parseFrontmatter(['---', 'long: >-', '', '  para one', '', '  para two', '---'].join('\n'));
+  assert.equal(front.long, 'para one\npara two');
+});

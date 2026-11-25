@@ -118,7 +118,9 @@ function setKey(out, key, value) {
 // A `|` or `>` block scalar from its (dedented) lines: `|` keeps the line breaks, `>` folds
 // lines into one with spaces (a blank line stays a break); `-` strips the final break, else it
 // ends with exactly one (trailing blank lines are already gone, so `+` reads like the default).
-function blockScalarOf(style, chomp, lines) {
+function blockScalarOf(style, chomp, all) {
+  const start = all.findIndex((l) => l !== '');
+  const lines = start < 0 ? [] : all.slice(start);
   let text;
   if (style === '|') {
     text = lines.join('\n');
