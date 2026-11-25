@@ -307,3 +307,95 @@ test('the manifest provides reply-context, requires reply_context_provider, asks
   assert.deepEqual(keys, ['peopleFolder', 'voiceFolder', 'ownerPage', 'profileSections', 'aboutSections']);
   assert.equal(manifest.settings.length, 5);
 });
+
+// Final review I2: a knowledge base another tool writes carries ordinary YAML — nested maps,
+// lists of maps, folded and literal scalars, hyphenated keys and quoted commas. The reader takes
+// the keys it needs and skips the rest; only a frontmatter that opens and never closes is
+// unreadable.
+test('ordinary YAML frontmatter is read leniently: nested maps, lists of maps, > and | scalars, hyphenated keys', () => {
+  const text = [
+    '---',
+    'id: priya-n',
+    'date-created: 2026-01-12',
+    'meta:',
+    '  owner: me',
+    '  tags:',
+    '    - people',
+    'sources:',
+    '  - url: https://example.test/a',
+    '    title: "First, the intro"',
+    '  - url: https://example.test/b',
+    'summary: >',
+    '  Works on Atlas',
+    '  and the budget.',
+    'notes: |-',
+    '  line one',
+    '  line two',
+    'aliases: ["Nair, Priya", Priya N]',
+    'emails:',
+    '- priya.n@example.test',
+    '? complex key',
+    'teamsIds: [19999999999999999999]',
+    '---',
+    '# Priya N.',
+    '## Writing to them',
+    'Short.',
+  ].join('\n');
+  const { front } = parseFrontmatter(text);
+  assert.ok(front, 'the frontmatter is readable');
+  assert.equal(front['date-created'], '2026-01-12');
+  assert.deepEqual(front.meta, { owner: 'me', tags: ['people'] });
+  assert.deepEqual(front.sources, [
+    { url: 'https://example.test/a', title: 'First, the intro' },
+    { url: 'https://example.test/b' },
+  ]);
+  assert.equal(front.summary, 'Works on Atlas and the budget.\n');
+  assert.equal(front.notes, 'line one\nline two');
+  assert.deepEqual(front.aliases, ['Nair, Priya', 'Priya N']);
+  assert.deepEqual(front.emails, ['priya.n@example.test']);
+  assert.deepEqual(front.teamsIds, ['19999999999999999999'], 'a bare-digit scalar stays a string');
+
+  const person = personOf('People/priya-n.md', text, SETTINGS, {});
+  assert.equal(person.id, 'priya-n');
+  assert.deepEqual(person.names, ['Nair, Priya', 'Priya N', 'Priya N.']);
+  assert.deepEqual(person.addresses, ['priya.n@example.test']);
+  assert.equal(person.text, '## Writing to them\n\nShort.');
+});
+
+test('an inline map or list splits only on commas outside quotes and brackets', () => {
+  const { front } = parseFrontmatter([
+    '---',
+    "basedOn: {mail: 12, teams: 140}",
+    "pair: {title: 'a, b', n: 3}",
+    'list: [one, "two, three", [x, y], four]',
+    "bare: 000123",
+    '---',
+  ].join('\n'));
+  assert.deepEqual(front.basedOn, { mail: '12', teams: '140' });
+  assert.deepEqual(front.pair, { title: 'a, b', n: '3' });
+  assert.deepEqual(front.list, ['one', 'two, three', ['x', 'y'], 'four']);
+  assert.equal(front.bare, '000123');
+});
+
+test('a field the reader now finds as a map or a list of maps never becomes "[object Object]"', () => {
+  const text = [
+    '---',
+    'name:',
+    '  first: Dana',
+    'aliases:',
+    '  - label: DK',
+    '  - Dana K.',
+    'emails:',
+    '  - {address: dana@example.test}',
+    '  - dana.k@example.test',
+    'updated:',
+    '  at: 2026-01-01',
+    '---',
+    '# Dana Kowalski',
+  ].join('\n');
+  const person = personOf('People/dana.md', text, SETTINGS, {});
+  assert.equal(person.name, 'Dana Kowalski');
+  assert.deepEqual(person.names, ['Dana K.', 'Dana Kowalski']);
+  assert.deepEqual(person.addresses, ['dana.k@example.test']);
+  assert.equal(person.updatedAt, null);
+});

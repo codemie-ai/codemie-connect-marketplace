@@ -249,3 +249,12 @@ test('facts stops at 2.5 s and answers what it has', async () => {
     Date.now = realNow;
   }
 });
+
+// Final review I2: a nested frontmatter value counts as a frontmatter value (3), never as
+// "[object Object]".
+test('scorePage reads a term inside a nested frontmatter map or a list of maps', () => {
+  const text = ['---', 'meta:', '  project: Atlas', 'sources:', '  - title: Budget review', '---', '# Notes', 'Nothing here.'].join('\n');
+  assert.equal(scorePage({ path: 'notes/n.md', text }, ['Atlas']).score, 3);
+  assert.equal(scorePage({ path: 'notes/n.md', text }, ['Budget']).score, 3);
+  assert.equal(scorePage({ path: 'notes/n.md', text }, ['object']), null);
+});

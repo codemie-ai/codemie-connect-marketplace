@@ -13,27 +13,48 @@
 // later task's job and is left empty here on purpose.
 
 // ------------------------------------------------------------------------------------------------
-// A small, deterministic YAML-frontmatter reader: just enough for a person page's `id`, `name`,
-// `aliases`, `emails`, `email`, `teamsIds`, `sources`, `updated_at`, `updated`, `confidence`, and
-// a style card's `basedOn` and `built`. Never a full YAML parser (no nesting beyond one level, no
-// anchors, no multi-line scalars): a knowledge base's own tools write richer YAML at their peril,
-// but these fields are all plain scalars or flat lists.
+// A small, deterministic, lenient YAML-frontmatter reader: enough for a person page's `id`,
+// `name`, `aliases`, `emails`, `email`, `teamsIds`, `updated_at`, `updated`, and a style card's
+// `basedOn` and `built`. The folder can be a knowledge base another tool writes, so it reads the
+// ordinary YAML such tools use (nested maps, lists of maps, `>` and `|` block scalars, hyphenated
+// keys, quoted commas in an inline list) and skips any line it doesn't understand instead of
+// giving up on the page. Never a full YAML parser: no anchors, tags or multi-document streams.
 
 const FENCE = /^---\s*$/;
+const KEY_LINE = /^("[^"]*"|'[^']*'|[A-Za-z_][\w .-]*?)\s*:(?:\s+(.*)|$)/;
+const KEY_TIGHT = /^([A-Za-z_][\w.-]*):(\S.*)$/;
+const BLOCK_SCALAR = /^([|>])([+-]?)\d*([+-]?)\s*(?:#.*)?$/;
+const LIST_ITEM = /^-(?:\s|$)/;
 
+function indentOf(line) {
+  const at = line.search(/\S/);
+  return at < 0 ? Infinity : at;
+}
+
+// Lines shifted left by their smallest indent (blank lines kept, as blank).
+function dedent(lines) {
+  const min = Math.min(...lines.map(indentOf));
+  if (!Number.isFinite(min)) return lines.map(() => '');
+  return lines.map((l) => (l.trim() === '' ? '' : l.slice(min)));
+}
+
+// A quoted scalar's inside, with any trailing ` # comment` after the closing quote dropped; an
+// unquoted one with its trailing comment dropped.
 function unquote(raw) {
   const t = raw.trim();
-  if (t.length >= 2 && ((t[0] === '"' && t.endsWith('"')) || (t[0] === "'" && t.endsWith("'")))) {
-    return t.slice(1, -1);
+  const q = t[0];
+  if (q === '"' || q === "'") {
+    const close = t.indexOf(q, 1);
+    if (close > 0 && /^\s*(?:#.*)?$/.test(t.slice(close + 1))) return t.slice(1, close);
   }
-  return t;
+  return t.replace(/\s+#.*$/, '');
 }
 
 // A bare scalar: null/blank, a bool, else the (unquoted) string as written — deliberately never a
 // JS `Number`, even for digit-only text: an id (a Teams id, a frontmatter `id`) is opaque text,
 // and a `Number` round-trip silently rounds anything past `Number.MAX_SAFE_INTEGER` (review fix
 // round 1). `basedOn`'s counts are the one place a number is wanted, and `styleOf` converts them
-// itself with `Number(...)`, which works the same over a string or a bare number either way.
+// itself with `Number(...)`.
 function scalarOf(raw) {
   const t = raw.trim();
   if (t === '' || t === '~' || t.toLowerCase() === 'null') return null;
@@ -42,71 +63,159 @@ function scalarOf(raw) {
   return unquote(t);
 }
 
-// `[a, b, c]` -> ["a", "b", "c"]; `{a: 1, b: 2}` -> {a: 1, b: 2} (one level, comma-separated;
-// `null` for a pair that doesn't split cleanly, so the caller can treat the whole value as
-// unreadable rather than guess).
-function inlineListOf(raw) {
-  const inner = raw.trim().replace(/^\[/, '').replace(/\]\s*$/, '');
-  if (!inner.trim()) return [];
-  return inner.split(',').map((item) => scalarOf(item));
+// `inner` split on the commas that sit outside quotes and brackets: `"Nair, Priya", Priya N`
+// is two items, not three. A quote opens only at an item's (or a map value's) start, so
+// `O'Brien` stays one word.
+function splitFlow(inner) {
+  const parts = [];
+  let depth = 0;
+  let quote = null;
+  let cur = '';
+  for (const ch of inner) {
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && /(?:^|:)\s*$/.test(cur)) quote = ch;
+    else if (ch === '[' || ch === '{') depth += 1;
+    else if (ch === ']' || ch === '}') depth -= 1;
+    if (ch === ',' && depth === 0) {
+      parts.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  parts.push(cur);
+  return parts.filter((p) => p.trim() !== '');
 }
 
-function inlineMapOf(raw) {
-  const inner = raw.trim().replace(/^\{/, '').replace(/\}\s*$/, '');
-  if (!inner.trim()) return {};
-  const out = {};
-  for (const pair of inner.split(',')) {
-    const at = pair.indexOf(':');
-    if (at < 0) return null;
-    out[pair.slice(0, at).trim()] = scalarOf(pair.slice(at + 1));
+// One value written on a line: `[a, b]`, `{a: 1}` (nested either way), else a scalar. A pair of
+// an inline map with no `:` is skipped, not fatal.
+function valueOf(raw) {
+  const t = raw.trim();
+  if (t.startsWith('[') && t.endsWith(']')) return splitFlow(t.slice(1, -1)).map(valueOf);
+  if (t.startsWith('{') && t.endsWith('}')) {
+    const out = {};
+    for (const pair of splitFlow(t.slice(1, -1))) {
+      const m = KEY_LINE.exec(pair.trim()) ?? KEY_TIGHT.exec(pair.trim());
+      if (!m) continue;
+      setKey(out, unquote(m[1]), valueOf(m[2] ?? ''));
+    }
+    return out;
+  }
+  return scalarOf(t);
+}
+
+function setKey(out, key, value) {
+  if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+  out[key] = value;
+}
+
+// A `|` or `>` block scalar from its (dedented) lines: `|` keeps the line breaks, `>` folds
+// lines into one with spaces (a blank line stays a break); `-` strips the final break, else it
+// ends with exactly one (trailing blank lines are already gone, so `+` reads like the default).
+function blockScalarOf(style, chomp, lines) {
+  let text;
+  if (style === '|') {
+    text = lines.join('\n');
+  } else {
+    text = '';
+    for (const line of lines) {
+      if (line === '') text += '\n';
+      else text += text === '' || text.endsWith('\n') ? line : ` ${line}`;
+    }
+  }
+  const body = text.replace(/\n+$/, '');
+  if (chomp === '-') return body;
+  return body ? `${body}\n` : '';
+}
+
+// A key's value from what follows its colon (`rest`) and its indented child lines.
+function blockValueOf(rest, children) {
+  while (children.length && children[children.length - 1].trim() === '') children.pop();
+  const kids = dedent(children);
+  const block = BLOCK_SCALAR.exec(rest);
+  if (block) return blockScalarOf(block[1], block[2] || block[3], kids);
+  if (rest.trim() !== '' && !rest.trim().startsWith('#')) {
+    // A flow list or a plain scalar that wraps onto indented lines.
+    return valueOf([rest, ...kids.map((l) => l.trim())].filter(Boolean).join(' '));
+  }
+  const first = kids.find((l) => l.trim() !== '' && !l.trimStart().startsWith('#'));
+  if (first === undefined) return null;
+  return LIST_ITEM.test(first) ? listOf(kids) : mapOf(kids);
+}
+
+// A block list's (dedented) lines: each `- ` item with the more-indented lines after it. An item
+// that starts with `key:` is a map (a list of maps); a bare `-` takes its block below.
+function listOf(lines) {
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!LIST_ITEM.test(line)) {
+      i += 1;
+      continue;
+    }
+    const after = line.slice(1);
+    const pad = 1 + (after.length - after.trimStart().length);
+    const first = line.slice(pad);
+    const cont = [];
+    let j = i + 1;
+    while (j < lines.length && (lines[j].trim() === '' || indentOf(lines[j]) > 0)) {
+      cont.push(lines[j]);
+      j += 1;
+    }
+    if (first.trim() === '' || first.trimStart().startsWith('#')) {
+      out.push(blockValueOf('', cont));
+    } else if (!/^["'[{]/.test(first) && KEY_LINE.test(first)) {
+      out.push(mapOf(dedent([`${' '.repeat(pad)}${first}`, ...cont])));
+    } else {
+      out.push(blockValueOf(first, cont));
+    }
+    i = j;
   }
   return out;
 }
 
-// The frontmatter's lines (without the `---` fences) as a flat object, or `null` when a line
-// isn't `key: value` (a block list's `- item` lines aside): the page's frontmatter doesn't parse,
-// and `parseFrontmatter` turns that into "this page is unreadable" for its caller.
-function parseYamlLines(lines) {
+// A block map's (dedented) lines -> an object. A line at the map's own indent that isn't
+// `key: value` is skipped with its children; nothing here makes the whole page unreadable.
+function mapOf(lines) {
   const out = {};
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (line.trim() === '' || line.trimStart().startsWith('#')) {
+    if (line.trim() === '' || line.trimStart().startsWith('#') || indentOf(line) > 0) {
       i += 1;
       continue;
     }
-    const m = /^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/.exec(line);
-    if (!m) return null;
-    const [, key, rest] = m;
-    if (rest.trim() === '') {
-      // Maybe a block list: indented "- item" lines right after the key.
-      const items = [];
-      let j = i + 1;
-      while (j < lines.length && /^\s*-\s*/.test(lines[j]) && /\S/.test(lines[j]) && lines[j].search(/\S/) > 0) {
-        items.push(scalarOf(lines[j].replace(/^\s*-\s*/, '')));
+    const m = KEY_LINE.exec(line) ?? KEY_TIGHT.exec(line);
+    const rest = m ? (m[2] ?? '') : '';
+    // The key's children: the more-indented lines after it, and — for a key with nothing after
+    // its colon — a `- ` list written at the key's own indent.
+    const sameIndentList = m && rest.trim() === '';
+    const children = [];
+    let j = i + 1;
+    while (j < lines.length) {
+      const next = lines[j];
+      if (next.trim() === '' || indentOf(next) > 0 || (sameIndentList && LIST_ITEM.test(next))) {
+        children.push(next);
         j += 1;
+      } else {
+        break;
       }
-      out[key] = items.length ? items : null;
-      i = j;
-    } else if (rest.trim().startsWith('[')) {
-      out[key] = inlineListOf(rest);
-      i += 1;
-    } else if (rest.trim().startsWith('{')) {
-      const map = inlineMapOf(rest);
-      if (map === null) return null;
-      out[key] = map;
-      i += 1;
-    } else {
-      out[key] = scalarOf(rest);
-      i += 1;
     }
+    if (m) setKey(out, unquote(m[1]), blockValueOf(rest, children));
+    i = j;
   }
   return out;
 }
 
 // `text` -> `{front, body}`. No opening `---` line at all: an empty, valid frontmatter (a plain
-// knowledge-base page is still readable). An opening `---` with no closing one, or YAML
-// `parseYamlLines` can't read: `front` is `null` — unreadable, the caller skips the page.
+// knowledge-base page is still readable). Only an opening `---` with no closing one makes
+// `front` `null` — unreadable, the caller skips (and counts) the page; YAML lines the reader
+// doesn't understand are skipped, never fatal.
 export function parseFrontmatter(text) {
   const src = String(text ?? '');
   const lines = src.split(/\r\n|\n/);
@@ -121,8 +230,7 @@ export function parseFrontmatter(text) {
     }
   }
   if (end < 0) return { front: null, body: src };
-  const front = parseYamlLines(lines.slice(1, end));
-  if (front === null) return { front: null, body: src };
+  const front = mapOf(dedent(lines.slice(1, end)));
   return { front, body: lines.slice(end + 1).join('\n') };
 }
 
@@ -248,17 +356,30 @@ function joinSections(picked) {
  * `aboutSections` as their comma-separated strings); `ids` is the parsed `Voice/ids.json` object
  * (or `{}`/`null` when there is none). `null` when the page's frontmatter doesn't parse.
  */
+// A frontmatter field's scalar, or `null` when it is a map or a list (another tool's richer shape
+// for a field Knowledge reads as plain text).
+function plainOf(v) {
+  return v !== null && typeof v === 'object' ? null : v;
+}
+
+// A field written as one scalar or a list, as its non-blank scalars (maps inside it left out).
+function plainsOf(v, { single = true } = {}) {
+  const list = Array.isArray(v) ? v : (single && v !== null && v !== undefined ? [v] : []);
+  return list
+    .map(plainOf)
+    .filter((a) => a !== null && a !== undefined && String(a).trim() !== '');
+}
+
 export function personOf(path, text, settings = {}, ids = {}) {
   const { front, body } = parseFrontmatter(text);
   if (front === null) return null;
 
   const h1 = h1Of(body);
-  const aliases = (Array.isArray(front.aliases) ? front.aliases : [])
-    .filter((a) => a !== null && a !== undefined && String(a).trim() !== '')
-    .map(String);
+  const aliases = plainsOf(front.aliases, { single: false }).map(String);
   const fileSlug = slug(baseNameOf(path));
 
-  const name = (front.name && String(front.name).trim())
+  const frontName = plainOf(front.name);
+  const name = (frontName && String(frontName).trim())
     || h1
     || aliases[0]
     || titleCaseOf(fileSlug);
@@ -269,15 +390,11 @@ export function personOf(path, text, settings = {}, ids = {}) {
   // looking id can arrive as a bare number from one source and a string from another (`Voice/
   // ids.json` is always JSON strings), and `Set` treats `123` and `"123"` as distinct unless the
   // values are normalized first.
-  const emails = Array.isArray(front.emails) ? front.emails : (front.emails ? [front.emails] : []);
-  const singleEmail = front.email ? [front.email] : [];
   const addresses = [...new Set(
-    [...emails, ...singleEmail]
-      .filter((a) => a !== null && a !== undefined && String(a).trim() !== '')
-      .map(String),
+    [...plainsOf(front.emails), ...plainsOf(front.email)].map(String),
   )].slice(0, 10);
 
-  const teamsIds = Array.isArray(front.teamsIds) ? front.teamsIds : [];
+  const teamsIds = plainsOf(front.teamsIds, { single: false });
   const fromIdsFile = ids && Array.isArray(ids[fileSlug]) ? ids[fileSlug] : [];
   const personIds = [...new Set(
     [...teamsIds, ...fromIdsFile]
@@ -290,14 +407,14 @@ export function personOf(path, text, settings = {}, ids = {}) {
   const aboutText = cut(joinSections(sectionsNamed(sections, settings.aboutSections)), 2000);
 
   return {
-    id: (front.id && String(front.id).trim()) || slug(name) || fileSlug,
+    id: (plainOf(front.id) && String(front.id).trim()) || slug(name) || fileSlug,
     name,
     names,
     addresses,
     ids: personIds,
     text: profileText,
     about: aboutText,
-    updatedAt: front.updated_at ?? front.updated ?? null,
+    updatedAt: plainOf(front.updated_at ?? front.updated ?? null),
     source: path,
   };
 }
@@ -597,10 +714,11 @@ async function readIds(ctx, root, voiceFolder) {
 
 // Every readable person page under the people folder, design §8's "Reading a person page", at
 // most `MAX_PEOPLE_PAGES`; a page whose frontmatter can't be read, or past that cap, counts as
-// `skipped` (`status`'s own count, ruling "Known limits").
+// `skipped` (`status`'s own count, ruling "Known limits"). `unreadable` names the pages that
+// couldn't be read, for Knowledge's own page.
 async function readAllPeople(ctx, root, entries) {
   const peopleFolder = matchFolder(entries, setting(ctx, 'peopleFolder', DEFAULT_PEOPLE_FOLDER));
-  if (!peopleFolder) return { people: [], skipped: 0 };
+  if (!peopleFolder) return { people: [], skipped: 0, unreadable: [] };
   const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER));
   const ids = await readIds(ctx, root, voiceFolder);
   const settingsObj = {
@@ -612,17 +730,18 @@ async function readAllPeople(ctx, root, entries) {
   const capped = all.slice(0, MAX_PEOPLE_PAGES);
   let skipped = Math.max(0, all.length - MAX_PEOPLE_PAGES);
   const people = [];
+  const unreadable = [];
   for (const f of capped) {
     const text = await safeRead(ctx, root, f.path);
-    if (text === null) {
+    const person = text === null ? null : personOf(f.path, text, settingsObj, ids);
+    if (person) {
+      people.push(person);
+    } else {
       skipped += 1;
-      continue;
+      unreadable.push(f.path);
     }
-    const person = personOf(f.path, text, settingsObj, ids);
-    if (person) people.push(person);
-    else skipped += 1;
   }
-  return { people, skipped };
+  return { people, skipped, unreadable };
 }
 
 // The style card and the rules as `context` and `export` answer them (design §1's shapes):
@@ -812,17 +931,22 @@ function wordIncludes(haystackFolded, termFolded) {
  * then takes no part in the ranking). `updatedAt` is the page's own frontmatter field, for the
  * ranking's "newest first" tiebreak.
  */
+// Every scalar inside a frontmatter value, however deep its maps and lists go.
+function leavesOf(v) {
+  if (v === null || v === undefined) return [];
+  if (Array.isArray(v)) return v.flatMap(leavesOf);
+  if (typeof v === 'object') return Object.values(v).flatMap(leavesOf);
+  return [v];
+}
+
 export function scorePage(page, terms) {
   const raw = String(page?.text ?? '');
   const { front, body } = parseFrontmatter(raw);
   if (front === null) return null;
   const h1 = h1Of(body);
-  const aliases = Array.isArray(front.aliases) ? front.aliases.map(String) : [];
+  const aliases = plainsOf(front.aliases, { single: false }).map(String);
   const headings = sectionsOf(body).map((s) => s.heading);
-  const frontValues = Object.values(front)
-    .flatMap((v) => (Array.isArray(v) ? v : [v]))
-    .filter((v) => v !== null && v !== undefined)
-    .map(String);
+  const frontValues = leavesOf(front).map(String);
   const topFolded = foldText([h1, ...aliases].filter(Boolean).join(' '));
   const midFolded = foldText([...headings, ...frontValues].join(' '));
   const bodyFolded = foldText(stripLinks(body));
@@ -842,7 +966,7 @@ export function scorePage(page, terms) {
     }
   }
   if (distinct === 0) return null;
-  return { score, distinct, updatedAt: (front.updated_at ?? front.updated) || null };
+  return { score, distinct, updatedAt: plainOf(front.updated_at ?? front.updated ?? null) || null };
 }
 
 // Cuts `s` to at most `max` characters, no ellipsis — Connect's own `facts.rs` cuts a fact's
@@ -1393,11 +1517,12 @@ async function summaryImpl(ctx) {
   } catch {
     return { folder: root, people: 0, peopleWithProfile: 0, rules: 0, style: false, buildWithAi };
   }
-  const { people } = await readAllPeople(ctx, root, entries);
+  const { people, unreadable } = await readAllPeople(ctx, root, entries);
   const full = await fullStyleAndRules(ctx, root, entries);
   return {
     folder: root,
     people: people.length,
+    unreadable,
     peopleWithProfile: people.filter((p) => p.text).length,
     rules: full.rules.length,
     style: Boolean(full.style.text),

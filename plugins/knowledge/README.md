@@ -13,7 +13,10 @@ your instructions and a new person's stub page.
 ## What it reads
 
 - **People** — every page under the People folder (its name matched without regard to case, so
-  `people/` works too) whose frontmatter parses, however little it says. A page's name comes from
+  `people/` works too), however little its frontmatter says. Ordinary YAML from other tools
+  (nested maps, lists of maps, `>` and `|` text, hyphenated keys) is fine: Knowledge takes the
+  fields it needs and skips the rest. Only a frontmatter that opens with `---` and never closes
+  makes a page unreadable; Knowledge's page names every page it skipped. A page's name comes from
   its frontmatter `name`, else its `# ` heading, else its first alias, else its file name. Its
   *profile* (how you write to them) is the sections named in the "Sections on how to write to
   someone" setting, best first — never the whole page. Its *about* (a few facts about them) is the

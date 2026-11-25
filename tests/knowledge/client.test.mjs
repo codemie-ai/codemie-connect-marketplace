@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  initialState, loadSummary, choose, pressBuild, confirmReplace, cancelReplace, setAskAi, addPerson,
+  initialState, loadSummary, choose, pressBuild, confirmReplace, cancelReplace, setAskAi, addPerson, skippedLine,
 } from '../../plugins/knowledge/client.js';
 
 // A minimal `ctx` stand-in: records every `call(name, args)` and answers from `answers[name]`
@@ -136,4 +136,15 @@ test('addPerson writes the stub and refreshes the summary', async () => {
   assert.equal(state.notice, 'Added a page for Jordan Lee.');
   assert.equal(state.summary.people, 1);
   assert.deepEqual(ctx.calls[0], { name: 'newPerson', args: { name: 'Jordan Lee', address: 'jordan@example.test' } });
+});
+
+// Final review I2: Knowledge's page says which pages it skipped, by name.
+test('skippedLine names the pages the reader could not read, or nothing when there are none', () => {
+  assert.equal(skippedLine({ unreadable: [] }), '');
+  assert.equal(skippedLine({}), '');
+  assert.equal(skippedLine({ unreadable: ['People/broken.md'] }), "Skipped 1 page it couldn't read: People/broken.md");
+  assert.equal(
+    skippedLine({ unreadable: ['People/a.md', 'People/b.md'] }),
+    "Skipped 2 pages it couldn't read: People/a.md, People/b.md",
+  );
 });

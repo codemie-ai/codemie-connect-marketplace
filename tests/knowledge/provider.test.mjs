@@ -402,3 +402,18 @@ test('the catalog lists knowledge, featured, categories replies', async () => {
   const manifest = JSON.parse(read(joinPath(here, '..', '..', 'plugins', 'knowledge', 'echo-plugin.json'), 'utf8'));
   assert.equal(manifest.version, '1.0.0');
 });
+
+// Final review I2: a page the reader still can't read is counted, never dropped silently —
+// `status` keeps its count, and Knowledge's own page names them through `summary`.
+test('summary names the people pages it could not read; status keeps the count in the same shape', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-unreadable-'));
+  write(dir, 'People/priya-n.md', PERSON_PRIYA);
+  write(dir, 'People/yaml-heavy.md', ['---', 'date-created: 2026-01-12', 'sources:', '  - url: https://example.test/a', '    title: A', '---', '# Dana K'].join('\n'));
+  write(dir, 'People/broken.md', ['---', 'name: Broken', '# Never closed'].join('\n'));
+  const { run } = setup({ dir });
+
+  assert.deepEqual(await run('status', {}), { ok: true, people: 2, rules: 0, style: false, skipped: 1 });
+  const summary = await run('summary', {});
+  assert.equal(summary.people, 2);
+  assert.deepEqual(summary.unreadable, ['People/broken.md']);
+});

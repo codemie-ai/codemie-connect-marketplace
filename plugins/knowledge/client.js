@@ -11,7 +11,7 @@
 
 export function initialState() {
   return {
-    summary: { folder: null, people: 0, peopleWithProfile: 0, rules: 0, style: false, buildWithAi: false },
+    summary: { folder: null, people: 0, peopleWithProfile: 0, rules: 0, style: false, buildWithAi: false, unreadable: [] },
     askAi: false,
     busy: false,
     notice: '',
@@ -121,6 +121,15 @@ export async function addPerson(ctx, state, name, address) {
   return state;
 }
 
+// The people pages Knowledge couldn't read (a frontmatter that opens and never closes, or a file
+// it can't open), by name, so a page never drops out of the counts silently; `''` when none.
+export function skippedLine(summary) {
+  const names = Array.isArray(summary?.unreadable) ? summary.unreadable : [];
+  if (!names.length) return '';
+  const pages = names.length === 1 ? 'page' : 'pages';
+  return `Skipped ${names.length} ${pages} it couldn't read: ${names.join(', ')}`;
+}
+
 export function apply(ctx) {
   const { esc, setRow, setCard } = ctx.ui;
   const state = initialState();
@@ -155,6 +164,7 @@ export function apply(ctx) {
         ])}
         ${setCard('Counts', [
           setRow('People', `${state.summary.people} (${state.summary.peopleWithProfile} with a profile)`, ''),
+          ...(skippedLine(state.summary) ? [setRow('', esc(skippedLine(state.summary)), '')] : []),
           setRow('Instructions', String(state.summary.rules), ''),
           setRow('Style card', styleLine, ''),
           setRow('', 'See and edit what Connect adds in Settings › Your voice.', ''),
