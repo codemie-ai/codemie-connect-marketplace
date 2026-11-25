@@ -258,3 +258,14 @@ test('scorePage reads a term inside a nested frontmatter map or a list of maps',
   assert.equal(scorePage({ path: 'notes/n.md', text }, ['Budget']).score, 3);
   assert.equal(scorePage({ path: 'notes/n.md', text }, ['object']), null);
 });
+
+test('facts leaves out a Voice folder configured under another name', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-facts-voicefolder-'));
+  write(dir, 'My Voice/style.md', '# Atlas\nAtlas wording from the style card.');
+  write(dir, 'My Voice/rules.md', '## topic: Atlas\nAtlas instruction.');
+  write(dir, 'notes/kept.md', '# Atlas rollout\nThe real match.');
+  const ctx = fakeCtx({ dir, settings: { voiceFolder: 'My Voice' } });
+  apply(ctx);
+  const answer = await ctx.run('facts', { terms: ['Atlas'], personId: null });
+  assert.deepEqual(answer.facts.map((f) => f.id), ['notes/kept.md']);
+});

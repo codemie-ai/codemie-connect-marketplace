@@ -399,3 +399,14 @@ test('a field the reader now finds as a map or a list of maps never becomes "[ob
   assert.deepEqual(person.addresses, ['dana.k@example.test']);
   assert.equal(person.updatedAt, null);
 });
+
+// Final review minor 5: the configured Voice folder is skipped whatever its name (nested too,
+// matched without regard to case); a folder that only happens to be called "voice" is notes.
+test('the walk skips the configured Voice folder, whatever its name', () => {
+  assert.equal(walkable('Connect/Voice/style.md', 'Connect/Voice'), false);
+  assert.equal(walkable('connect/voice/rules.md', 'Connect/Voice'), false);
+  assert.equal(walkable('Connect/notes.md', 'Connect/Voice'), true);
+  assert.equal(walkable('MyVoice/rules.md', 'MyVoice'), false);
+  assert.equal(walkable('voice/memo.md', 'MyVoice'), true, 'only the configured folder is skipped');
+  assert.equal(walkable('Voice/style.md'), false, 'the default is Voice');
+});

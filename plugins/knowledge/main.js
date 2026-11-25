@@ -549,18 +549,23 @@ export function styleOf(text, ownerText, ownerPath) {
 // the Voice folder, when reading notes for people or facts.
 
 /**
- * `walkable(path)`: whether a folder-relative path (`/`-separated) may be read for notes — `false`
- * inside `.git`, inside any hidden folder (a name starting with `.`), or inside the Voice folder
- * (matched without regard to case, as the people folder is).
+ * `walkable(path, voiceFolder)`: whether a folder-relative path (`/`-separated) may be read for
+ * notes — `false` inside `.git`, inside any hidden folder (a name starting with `.`), or inside
+ * the configured Voice folder (`voiceFolder`, `Voice` by default, nested or not, matched without
+ * regard to case, as the people folder is).
  */
-export function walkable(path) {
-  const segments = String(path ?? '')
+export function walkable(path, voiceFolder = DEFAULT_VOICE_FOLDER) {
+  const segmentsOf = (p) => String(p ?? '')
     .replace(/\\/g, '/')
     .replace(/^\.\//, '')
     .split('/')
     .filter(Boolean);
+  const segments = segmentsOf(path);
   if (segments.some((s) => s.startsWith('.'))) return false;
-  if (segments[0] && segments[0].toLowerCase() === 'voice') return false;
+  const voice = segmentsOf(voiceFolder).map((s) => s.toLowerCase());
+  if (voice.length && voice.every((s, i) => segments[i] && segments[i].toLowerCase() === s)) {
+    return false;
+  }
   return true;
 }
 
@@ -1090,9 +1095,10 @@ async function searchFacts(ctx, root, entries, args) {
   if (Date.now() > deadline) return { facts: [] };
 
   const files = (await ctx.fs.walk(root, {})) ?? [];
+  const voiceFolder = setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const candidates = [];
   for (const f of files.slice(0, FACTS_WALK_MAX)) {
-    if (!walkable(f.path)) continue;
+    if (!walkable(f.path, voiceFolder)) continue;
     if (!/\.md$/i.test(f.path)) continue;
     if (excludePath && f.path === excludePath) continue;
     if (f.size > FACTS_FILE_MAX) continue;
