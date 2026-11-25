@@ -417,3 +417,21 @@ test('summary names the people pages it could not read; status keeps the count i
   assert.equal(summary.people, 2);
   assert.deepEqual(summary.unreadable, ['People/broken.md']);
 });
+
+// Final review (re-graded Important): a style card Knowledge can't read — not UTF-8, over 1 MB
+// (above), or a frontmatter that opens and never closes — is never overwritten by a save or a
+// Build, since Connect showed it as empty and the user never saw what it holds.
+test('a style card whose frontmatter never closes is never overwritten: save and build refuse plainly', async () => {
+  const message = "refused: Knowledge can't read Voice/style.md: its frontmatter opens with --- and never closes. Close it in your folder, then try again.";
+  const broken = ['---', 'basedOn: {mail: 3, teams: 4}', 'Short and direct.', ''].join('\n');
+  for (const act of [
+    (ctx) => ctx.run('save', { kind: 'style', text: 'Plain words.' }),
+    (ctx) => ctx.run('build', { ai: false, replace: true }),
+    (ctx) => ctx.run('build', { ai: false }),
+  ]) {
+    const { ctx, root } = setup();
+    write(root, 'Voice/style.md', broken);
+    await assert.rejects(() => act(ctx), (e) => e.message === message);
+    assert.equal(readFileSync(join(root, 'Voice/style.md'), 'utf8'), broken, 'the card is unchanged');
+  }
+});

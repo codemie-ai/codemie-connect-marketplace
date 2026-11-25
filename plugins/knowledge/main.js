@@ -686,6 +686,17 @@ async function readPage(ctx, root, rel) {
   }
 }
 
+// Voice/style.md read exactly (`readPage`), and also refused when its frontmatter opens and never
+// closes: Connect then shows an empty card, so a save or a Build would replace text the user
+// never saw.
+async function readStylePage(ctx, root, rel) {
+  const current = await readPage(ctx, root, rel);
+  if (current !== null && parseFrontmatter(current).front === null) {
+    throw new Error(`refused: Knowledge can't read ${rel}: its frontmatter opens with --- and never closes. Close it in your folder, then try again.`);
+  }
+  return current;
+}
+
 // Every `ctx.fs.write` conflict Knowledge can hit (the fake's and the real host's own wording
 // differ slightly) becomes this one canned refusal — never the raw error, so a page's own text
 // can never reach it (ruling 22).
@@ -1306,7 +1317,7 @@ async function buildImpl(ctx, args = {}) {
     ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const rel = `${voiceFolder}/style.md`;
 
-  const current = await readPage(ctx, root, rel);
+  const current = await readStylePage(ctx, root, rel);
   const sha = current === null ? null : ctx.crypto.sha256(current);
   const { front, body: currentBody } = current === null
     ? { front: {}, body: '' }
@@ -1373,7 +1384,7 @@ async function saveStyleImpl(ctx, root, entries, args) {
   const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
     ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const rel = `${voiceFolder}/style.md`;
-  const current = await readPage(ctx, root, rel);
+  const current = await readStylePage(ctx, root, rel);
   const sha = current === null ? null : ctx.crypto.sha256(current);
   const { front } = current === null ? { front: {} } : parseFrontmatter(current);
   const fm = front ?? {};
