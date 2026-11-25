@@ -14,7 +14,7 @@ The layout follows Echo's `onetest-ai/echo-plugins`, which Connect's plugin engi
 | Plugin | What it does | Status |
 |---|---|---|
 | Todoist | Task provider: replaces Connect's built-in tasks while it is on | available |
-| Reply context | Per-person profiles and the user's style card for drafting replies | planned |
+| Knowledge | Your voice for Connect's reply drafts — people, a style card from your sent messages, instructions and facts — kept as Markdown in a folder you choose | available |
 | Podervianskyi notes | An informal meeting analysis in Russian, in Les Podervianskyi's style | planned |
 
 ## Use it in Connect while developing

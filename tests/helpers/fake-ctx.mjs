@@ -2,8 +2,10 @@
 // API, src-tauri/src/plugins/host/prelude.js), enough to exercise a provider plugin without the
 // real QuickJS host: `settings`, `http.fetch` routed through a handler, `store`, `log`,
 // `tasks.provide`, `replyContext.provide`/`.sent`, `fs` and `system.pickFolder` over a temp
-// folder, `claude.run`, and `run(op, args)` to call whatever a plugin registered, the way the
-// host would when it answers `tasks:<op>` or `replyContext:<op>`.
+// folder, `claude.run`, `command`/`crypto.sha256` (Knowledge's page commands and its
+// read-then-write compare-and-swap, the same `ctx.crypto.sha256` the real prelude.js gives a
+// plugin), and `run(op, args)` to call whatever a plugin registered, the way the host would when
+// it answers `tasks:<op>`, `replyContext:<op>` or a page's own command.
 //
 // A subset of echo-plugins' fake-ctx.mjs: only what Todoist's and Knowledge's `apply(ctx)` need.
 
@@ -38,6 +40,7 @@ export function fakeCtx({
   const storeFiles = new Map();
   const providedOps = {}; // ctx.tasks.provide
   const replyOps = {}; // ctx.replyContext.provide
+  const commands = {}; // ctx.command (a page's own host commands, called through ctx.call)
   const claudeCalls = [];
   const clock = { value: now ?? Date.UTC(2026, 10, 25) };
   const mtimes = new Map(); // relative, '/'-separated path -> ms, for files this ctx wrote
@@ -212,6 +215,11 @@ export function fakeCtx({
       },
     },
 
+    // `ctx.crypto.sha256(text)`: the same sha256-in-hex the real prelude.js gives a plugin (it
+    // bridges to the host's `crypto.sha256`), so a plugin can compute an `ifSha` guard from text
+    // it read, without any crypto of its own — exactly how the host's own `store.update` does it.
+    crypto: { sha256 },
+
     // `ctx.claude.run(opts)`: records every call's input in `_claudeCalls` and answers through
     // `claude.script(opts)` (a string, taken as `answer`, or a whole answer object) when given,
     // else `claude.answer` (default ""). The shape matches `claude.rs`'s real answer closely
@@ -256,10 +264,19 @@ export function fakeCtx({
       },
     },
 
-    // Test-only: calls the function a plugin gave `ctx.tasks.provide` or `ctx.replyContext.provide`
-    // for `op`, as the host would when the core asks `tasks:<op>` or `replyContext:<op>`.
+    // `ctx.command(name, fn)`: a page's own host command (Knowledge's `pickFolder`, `build`,
+    // `newPerson`, `summary`), called back through `ctx.call(name, args)` from its client half.
+    // There is no fake client half here, so a test calls it the same way `run` calls a provided
+    // op, below.
+    command: (name, fn) => {
+      commands[name] = fn;
+    },
+
+    // Test-only: calls the function a plugin gave `ctx.tasks.provide`, `ctx.replyContext.provide`
+    // or `ctx.command` for `op`/`name`, as the host would when the core asks `tasks:<op>`,
+    // `replyContext:<op>`, or the page calls `ctx.call(name, args)`.
     run: (op, args) => {
-      const fn = replyOps[op] ?? providedOps[op];
+      const fn = replyOps[op] ?? providedOps[op] ?? commands[op];
       if (typeof fn !== 'function') {
         throw new Error(`fakeCtx: the plugin didn't provide a "${op}" op`);
       }

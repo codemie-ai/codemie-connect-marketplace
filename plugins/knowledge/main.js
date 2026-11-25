@@ -424,10 +424,895 @@ export function walkable(path) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// `apply(ctx)`: the host half. Left empty in this task on purpose (plan step "Implement the pure
-// functions; no apply(ctx) yet beyond an empty export") — a later task walks the chosen folder
-// with the functions above and registers `ctx.replyContext.provide({status, export, context,
-// facts, save, remove})`.
-export function apply(_ctx) {
-  // Intentionally empty: see the plan's later tasks for Knowledge's ops.
+// Settings and the folder (design §8): defaults mirror echo-plugin.json's, since `ctx.settings.get`
+// answers `undefined` for a setting the user never touched.
+
+const DEFAULT_PEOPLE_FOLDER = 'People';
+const DEFAULT_VOICE_FOLDER = 'Voice';
+const DEFAULT_PROFILE_SECTIONS = 'Writing to them, Anti-patterns (do not write), Communication '
+  + 'Style, Communication Preferences, Example Exchange, Speech Acts, Shared Shorthand, '
+  + 'Vocabulary Cues, Communication Notes';
+const DEFAULT_ABOUT_SECTIONS = 'Overview, Snapshot, Roles And Background, Affiliations And '
+  + 'Roles, Working Style, Priorities';
+
+const NEEDS_SETUP = 'needs_setup: Choose your knowledge folder in Knowledge.';
+const PAGE_CHANGED = 'refused: The page changed in your folder. Refresh and try again.';
+
+// At most this many people pages are read (design §8's "Known limits"); the rest count as
+// skipped.
+const MAX_PEOPLE_PAGES = 2000;
+// Facts (design §10): the walk stops past this many files, skips anything over this size, and
+// the whole search stops after this budget, answering what it has.
+const FACTS_WALK_MAX = 5000;
+const FACTS_FILE_MAX = 200 * 1024;
+const FACTS_BUDGET_MS = 2500;
+const FACTS_ANSWER_MAX = 5;
+
+function setting(ctx, key, fallback) {
+  const v = ctx.settings.get(key);
+  return typeof v === 'string' && v.trim() ? v.trim() : fallback;
+}
+
+// The granted folder Knowledge reads and writes: the most recently chosen one (`ctx.fs.folders()`
+// never forgets an earlier grant on its own), or `null` when none was ever chosen.
+function rootOf(ctx) {
+  const folders = ctx.fs.folders() || [];
+  return folders.length ? folders[folders.length - 1] : null;
+}
+
+// No folder chosen -> `needs_setup`, as every op that needs the folder throws it (design §1,
+// §8's "Errors").
+function requireRoot(ctx) {
+  const root = rootOf(ctx);
+  if (!root) throw new Error(NEEDS_SETUP);
+  return root;
+}
+
+// The folder's top-level entries, or `needs_setup` when the folder itself is gone (design §8's
+// "Errors": "no folder chosen, or the folder is gone").
+async function listDirsOrThrow(ctx, root) {
+  try {
+    return await ctx.fs.list(root, '');
+  } catch {
+    throw new Error(NEEDS_SETUP);
+  }
+}
+
+// `People`/`people`, `Voice`/`voice`, … matched without regard to case (design §8: "the folder
+// name matched without regard to case, so people/ works"); `null` when no such top-level folder
+// exists yet.
+function matchFolder(entries, name) {
+  const lower = String(name ?? '').toLowerCase();
+  const hit = (entries ?? []).find((e) => e.dir && e.name.toLowerCase() === lower);
+  return hit ? hit.name : null;
+}
+
+// A file's text, or `null` when it isn't there (or can't be read) — never an error a caller has
+// to guard against on every read.
+async function safeRead(ctx, root, rel) {
+  try {
+    return await ctx.fs.read(root, rel);
+  } catch {
+    return null;
+  }
+}
+
+// Every `ctx.fs.write` conflict Knowledge can hit (the fake's and the real host's own wording
+// differ slightly) becomes this one canned refusal — never the raw error, so a page's own text
+// can never reach it (ruling 22).
+async function guardedWrite(ctx, root, rel, content, sha) {
+  const guard = sha ? { ifSha: sha } : { createNew: true };
+  try {
+    await ctx.fs.write(root, rel, content, guard);
+  } catch {
+    throw new Error(PAGE_CHANGED);
+  }
+}
+
+// `Voice/ids.json` (design §8): `{"<person slug>": ["<Teams id>", …]}`, or `{}` when there is
+// none or it doesn't parse.
+async function readIds(ctx, root, voiceFolder) {
+  if (!voiceFolder) return {};
+  const raw = await safeRead(ctx, root, `${voiceFolder}/ids.json`);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// Every readable person page under the people folder, design §8's "Reading a person page", at
+// most `MAX_PEOPLE_PAGES`; a page whose frontmatter can't be read, or past that cap, counts as
+// `skipped` (`status`'s own count, ruling "Known limits").
+async function readAllPeople(ctx, root, entries) {
+  const peopleFolder = matchFolder(entries, setting(ctx, 'peopleFolder', DEFAULT_PEOPLE_FOLDER));
+  if (!peopleFolder) return { people: [], skipped: 0 };
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER));
+  const ids = await readIds(ctx, root, voiceFolder);
+  const settingsObj = {
+    profileSections: setting(ctx, 'profileSections', DEFAULT_PROFILE_SECTIONS),
+    aboutSections: setting(ctx, 'aboutSections', DEFAULT_ABOUT_SECTIONS),
+  };
+  const files = await ctx.fs.walk(root, { path: peopleFolder, ext: ['md'] });
+  const all = files ?? [];
+  const capped = all.slice(0, MAX_PEOPLE_PAGES);
+  let skipped = Math.max(0, all.length - MAX_PEOPLE_PAGES);
+  const people = [];
+  for (const f of capped) {
+    const text = await safeRead(ctx, root, f.path);
+    if (text === null) {
+      skipped += 1;
+      continue;
+    }
+    const person = personOf(f.path, text, settingsObj, ids);
+    if (person) people.push(person);
+    else skipped += 1;
+  }
+  return { people, skipped };
+}
+
+// The style card and the rules as `context` and `export` answer them (design §1's shapes):
+// `styleOf`/`parseRules`'s own records, filled in with `source` and (for the style) `updatedAt`
+// and a fixed `editable: true` for every rule (Knowledge is the sole writer of its own
+// Voice/rules.md; there is no read-only rule at 1.0.0, ruling 17).
+async function fullStyleAndRules(ctx, root, entries) {
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER));
+  let styleRel = null;
+  let rulesRel = null;
+  let styleText = '';
+  let rulesText = '';
+  if (voiceFolder) {
+    styleRel = `${voiceFolder}/style.md`;
+    rulesRel = `${voiceFolder}/rules.md`;
+    styleText = (await safeRead(ctx, root, styleRel)) ?? '';
+    rulesText = (await safeRead(ctx, root, rulesRel)) ?? '';
+  }
+  const ownerPage = setting(ctx, 'ownerPage', '');
+  const ownerText = ownerPage ? await safeRead(ctx, root, ownerPage) : null;
+  const style = styleOf(styleText, ownerText, ownerPage || null);
+
+  let updatedAt = null;
+  if (styleRel) {
+    const st = await ctx.fs.stat(root, styleRel);
+    if (st && st.kind === 'file') updatedAt = new Date(st.mtime).toISOString();
+  }
+  const fullStyle = {
+    text: style.text,
+    updatedAt,
+    source: styleRel,
+    basedOn: style.basedOn,
+    head: style.head,
+  };
+  const rules = (rulesText ? parseRules(rulesText) : [])
+    .map((r) => ({ ...r, source: rulesRel, editable: true }));
+  return { style: fullStyle, rules };
+}
+
+// ------------------------------------------------------------------------------------------------
+// Matching one person (design §4's algorithm, run here so `context`'s own answer already names
+// the right person; ruling 26): Teams id first, then mail address, then a folded, order-free
+// name; an ambiguous match (more than one person) matches nobody.
+
+// A fold for comparing names "without regard to" case, diacritics, a trailing parenthesised
+// part, punctuation or word order (design §4: "so 'Nair Priya' matches 'Priya Nair'").
+export function foldName(name) {
+  return String(name ?? '')
+    .replace(/\s*\([^)]*\)\s*$/, '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .sort()
+    .join(' ');
+}
+
+export function matchPerson(people, who = {}) {
+  const list = Array.isArray(people) ? people : [];
+  const id = who?.id ? String(who.id) : null;
+  if (id) {
+    const hits = list.filter((p) => p.ids.includes(id));
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) return null;
+  }
+  const address = who?.address ? String(who.address).toLowerCase() : null;
+  if (address) {
+    const hits = list.filter((p) => p.addresses.some((a) => a.toLowerCase() === address));
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) return null;
+  }
+  const folded = who?.name ? foldName(who.name) : '';
+  if (folded) {
+    const hits = list.filter((p) => [p.name, ...p.names].some((n) => foldName(n) === folded));
+    if (hits.length === 1) return hits[0];
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Writing a rule into Voice/rules.md (the inverse of parseRules/headingScopeOf): a heading for
+// one `applies`, and the file's "## " blocks kept as raw text so an edit touches only its own
+// block, never another rule's (its import comment line included).
+
+function headingOf(applies = {}) {
+  let h;
+  if (applies.kind === 'no-profile') h = 'no-profile';
+  else if (applies.kind === 'everyone') h = 'everyone';
+  else h = `${applies.kind}: ${applies.value}`;
+  if (applies.channel) h += ` · ${applies.channel}`;
+  return h;
+}
+
+// `text` -> `{preamble, blocks: [{heading, lines}]}`: every "## " block, raw, in document order;
+// `preamble` is whatever came before the first one (Voice/rules.md has none in practice, but a
+// hand-edited file might).
+function parseBlocks(text) {
+  const lines = String(text ?? '').split(/\r\n|\n/);
+  const preamble = [];
+  const blocks = [];
+  let current = null;
+  for (const line of lines) {
+    const h = /^##\s+(.+?)\s*$/.exec(line);
+    if (h) {
+      if (current) blocks.push(current);
+      current = { heading: h[1].trim(), lines: [] };
+    } else if (current) {
+      current.lines.push(line);
+    } else {
+      preamble.push(line);
+    }
+  }
+  if (current) blocks.push(current);
+  return { preamble: preamble.join('\n'), blocks };
+}
+
+function renderBlocks(preamble, blocks) {
+  const parts = [];
+  const pre = String(preamble ?? '').trim();
+  if (pre) parts.push(pre);
+  for (const b of blocks) {
+    const body = b.lines.join('\n').trim();
+    parts.push(body ? `## ${b.heading}\n${body}` : `## ${b.heading}`);
+  }
+  return parts.length ? `${parts.join('\n\n')}\n` : '';
+}
+
+// The id `parseRules`/`ruleId` would give each block, in order (so a save or a remove finds the
+// same id a read would report).
+function idsOfBlocks(blocks) {
+  const taken = new Set();
+  return blocks.map((b) => {
+    const scope = headingScopeOf(b.heading);
+    const rid = scope ? ruleId(b.heading, taken) : null;
+    if (rid) taken.add(rid);
+    return rid;
+  });
+}
+
+// A minimal YAML-frontmatter writer: just enough to round-trip what Knowledge itself writes
+// (`basedOn: {mail, teams}`, `built: <sha>`, a person's `name`/`emails`) — never a full writer.
+function renderFrontmatter(fm) {
+  const entries = Object.entries(fm ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== '');
+  if (!entries.length) return '';
+  const lines = ['---'];
+  for (const [k, v] of entries) {
+    if (Array.isArray(v)) {
+      lines.push(`${k}: [${v.map(String).join(', ')}]`);
+    } else if (v && typeof v === 'object') {
+      lines.push(`${k}: {${Object.entries(v).map(([kk, vv]) => `${kk}: ${vv}`).join(', ')}}`);
+    } else {
+      lines.push(`${k}: ${v}`);
+    }
+  }
+  lines.push('---', '');
+  return lines.join('\n');
+}
+
+// ------------------------------------------------------------------------------------------------
+// Facts (design §10 "Knowledge's search"): deterministic, no AI, over this folder only.
+
+function foldText(s) {
+  return String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Whole-word, case- and diacritic-folded: `termFolded` must sit between two non-letter-or-digit
+// characters (or the ends), so "budget" never matches inside "budgetary".
+function wordIncludes(haystackFolded, termFolded) {
+  if (!termFolded) return false;
+  const re = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegex(termFolded)}(?:$|[^\\p{L}\\p{N}])`, 'u');
+  return re.test(` ${haystackFolded} `);
+}
+
+/**
+ * `scorePage({path, text}, terms)`: design §10's score — a term in the H1 or an alias is worth
+ * 5, in a "## " heading or a frontmatter value 3, in the body 1 (a term's *best* location counts
+ * once, never added twice); `null` when the page is unreadable or no term is found at all (it
+ * then takes no part in the ranking). `updatedAt` is the page's own frontmatter field, for the
+ * ranking's "newest first" tiebreak.
+ */
+export function scorePage(page, terms) {
+  const raw = String(page?.text ?? '');
+  const { front, body } = parseFrontmatter(raw);
+  if (front === null) return null;
+  const h1 = h1Of(body);
+  const aliases = Array.isArray(front.aliases) ? front.aliases.map(String) : [];
+  const headings = sectionsOf(body).map((s) => s.heading);
+  const frontValues = Object.values(front)
+    .flatMap((v) => (Array.isArray(v) ? v : [v]))
+    .filter((v) => v !== null && v !== undefined)
+    .map(String);
+  const topFolded = foldText([h1, ...aliases].filter(Boolean).join(' '));
+  const midFolded = foldText([...headings, ...frontValues].join(' '));
+  const bodyFolded = foldText(stripLinks(body));
+
+  let score = 0;
+  let distinct = 0;
+  for (const term of terms ?? []) {
+    const tf = foldText(term);
+    if (!tf) continue;
+    let weight = 0;
+    if (wordIncludes(topFolded, tf)) weight = 5;
+    else if (wordIncludes(midFolded, tf)) weight = 3;
+    else if (wordIncludes(bodyFolded, tf)) weight = 1;
+    if (weight > 0) {
+      score += weight;
+      distinct += 1;
+    }
+  }
+  if (distinct === 0) return null;
+  return { score, distinct, updatedAt: (front.updated_at ?? front.updated) || null };
+}
+
+/**
+ * `snippetOf({path, text}, terms)`: the page's H1 (else its slugged file name, title-cased) as
+ * `title`; `text` the lines holding a term, each with its nearest "## " heading, frontmatter
+ * removed and `[[links]]` read as text, cut to 500 characters (design §10's "The answer and its
+ * limits").
+ */
+export function snippetOf(page, terms) {
+  const raw = String(page?.text ?? '');
+  const { body } = parseFrontmatter(raw);
+  const h1 = h1Of(body);
+  const title = h1 || titleCaseOf(slug(baseNameOf(page?.path ?? '')));
+  const termsFolded = (terms ?? []).map(foldText).filter(Boolean);
+  const lines = stripLinks(body).split(/\r\n|\n/);
+  let heading = null;
+  let lastEmitted = null;
+  const out = [];
+  for (const rawLine of lines) {
+    const h = /^##\s+(.+?)\s*$/.exec(rawLine);
+    if (h) {
+      heading = h[1].trim();
+      continue;
+    }
+    const line = rawLine.trim();
+    if (!line) continue;
+    const folded = foldText(line);
+    if (termsFolded.some((t) => wordIncludes(folded, t))) {
+      if (heading && heading !== lastEmitted) {
+        out.push(`## ${heading}`);
+        lastEmitted = heading;
+      }
+      out.push(line);
+    }
+  }
+  const text = cut(out.join('\n').trim(), 500);
+  return { title, text };
+}
+
+// The `facts` op itself: the walk, the scoring, the 2.5 s budget and the top-5 ranking (design
+// §10).
+async function searchFacts(ctx, root, entries, args) {
+  const terms = Array.isArray(args?.terms)
+    ? args.terms.map((t) => String(t ?? '').trim()).filter(Boolean)
+    : [];
+  if (!terms.length) return { facts: [] };
+
+  let excludePath = null;
+  if (args?.personId) {
+    const { people } = await readAllPeople(ctx, root, entries);
+    const match = people.find((p) => p.id === args.personId);
+    if (match) excludePath = match.source;
+  }
+
+  const files = (await ctx.fs.walk(root, {})) ?? [];
+  const candidates = [];
+  for (const f of files.slice(0, FACTS_WALK_MAX)) {
+    if (!walkable(f.path)) continue;
+    if (!/\.md$/i.test(f.path)) continue;
+    if (excludePath && f.path === excludePath) continue;
+    if (f.size > FACTS_FILE_MAX) continue;
+    candidates.push(f);
+  }
+
+  const deadline = Date.now() + FACTS_BUDGET_MS;
+  const scored = [];
+  for (const f of candidates) {
+    if (Date.now() > deadline) break;
+    const text = await safeRead(ctx, root, f.path);
+    if (text === null) continue;
+    const result = scorePage({ path: f.path, text }, terms);
+    if (!result) continue;
+    scored.push({ path: f.path, text, ...result });
+  }
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.distinct !== a.distinct) return b.distinct - a.distinct;
+    const at = a.updatedAt ? Date.parse(a.updatedAt) : -Infinity;
+    const bt = b.updatedAt ? Date.parse(b.updatedAt) : -Infinity;
+    return bt - at;
+  });
+
+  const out = scored.slice(0, FACTS_ANSWER_MAX).map((p) => {
+    const snip = snippetOf({ path: p.path, text: p.text }, terms);
+    const fact = { id: p.path, title: snip.title, text: snip.text };
+    if (p.updatedAt) fact.updatedAt = p.updatedAt;
+    return fact;
+  });
+  return { facts: out };
+}
+
+// ------------------------------------------------------------------------------------------------
+// Build style card (design §8 "Build style card"): local facts, pure and tested, from the user's
+// sent messages; the AI wording is optional and never runs on its own (ruling 9).
+
+const GREETINGS = ['hi', 'hello', 'hey', 'dear', 'привет', 'здравствуйте', 'вітаю', 'привіт'];
+const SIGNOFFS = [
+  'regards', 'best', 'thanks', 'thank you', 'cheers',
+  'спасибо', 'с уважением', 'дякую', 'з повагою', 'з найкращими',
+];
+const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
+const PHONE_RE = /\+?\d[\d().\s-]{6,}\d/g;
+
+function wordsOf(text) {
+  return String(text ?? '').trim().split(/\s+/).filter(Boolean);
+}
+
+function firstLine(text) {
+  return String(text ?? '').split(/\r?\n/).find((l) => l.trim()) ?? '';
+}
+
+// Whether `text` ends with `phrase` (design §8: "sign-offs ... mail only from what the previews
+// hold" — a cut preview often has no line break at all before its sign-off, so this checks the
+// end of the whole text, not just its last line), allowing one trailing punctuation mark.
+function endsWithPhrase(text, phrase) {
+  const t = String(text ?? '').trim().toLowerCase();
+  const p = phrase.toLowerCase();
+  return t.endsWith(p) || /[.,!]$/.test(t.slice(-1)) && t.slice(0, -1).trimEnd().endsWith(p);
+}
+
+// The language rule (design §4): mostly Latin -> "en"; Cyrillic with і/ї/є/ґ -> "uk"; other
+// Cyrillic -> "ru"; anything else -> "none".
+export function languageOf(text) {
+  const t = String(text ?? '');
+  if (!/[Ѐ-ӿ]/.test(t)) return /[A-Za-z]/.test(t) ? 'en' : 'none';
+  if (/[іїєґІЇЄҐ]/.test(t)) return 'uk';
+  return 'ru';
+}
+
+function startsLower(text) {
+  const ch = firstLine(text).trimStart()[0];
+  return Boolean(ch) && ch === ch.toLowerCase() && ch !== ch.toUpperCase();
+}
+
+function mostCommon(counts) {
+  let best = null;
+  let bestN = 0;
+  for (const [k, n] of counts) {
+    if (n > bestN) {
+      best = k;
+      bestN = n;
+    }
+  }
+  return best;
+}
+
+function statsOf(messages) {
+  if (!messages.length) return { count: 0 };
+  const wordCounts = messages.map((m) => wordsOf(m.text).length).sort((a, b) => a - b);
+  const typicalWords = wordCounts[Math.floor(wordCounts.length / 2)] ?? 0;
+  const greetingCounts = new Map();
+  const signoffCounts = new Map();
+  let lowerStarts = 0;
+  let emojiCount = 0;
+  let exclaimCount = 0;
+  for (const m of messages) {
+    const text = String(m.text ?? '');
+    const first = firstLine(text).trim().toLowerCase();
+    const greet = GREETINGS.find((g) => first.startsWith(g));
+    if (greet) greetingCounts.set(greet, (greetingCounts.get(greet) ?? 0) + 1);
+    const signoff = SIGNOFFS.find((g) => endsWithPhrase(text, g));
+    if (signoff) signoffCounts.set(signoff, (signoffCounts.get(signoff) ?? 0) + 1);
+    if (startsLower(text)) lowerStarts += 1;
+    if (EMOJI_RE.test(text)) emojiCount += 1;
+    if (text.includes('!')) exclaimCount += 1;
+  }
+  const n = messages.length;
+  return {
+    count: n,
+    typicalWords,
+    greeting: mostCommon(greetingCounts),
+    signoff: mostCommon(signoffCounts),
+    lowerCaseStart: lowerStarts * 2 > n,
+    emoji: emojiCount * 2 > n,
+    exclamation: exclaimCount * 2 > n,
+  };
+}
+
+/**
+ * `styleFacts(messages)`: `messages` as `ctx.replyContext.sent` answers them (`{channel: "mail" |
+ * "chat", text, …}`) -> `{mail, teams, languages}`, each a `statsOf` record — the typical length
+ * in words, the greeting and sign-off used most, whether most start lower-case, use emoji or an
+ * exclamation mark. `languages` holds one entry per `"mail·ru"`/`"teams·uk"` … combination with
+ * at least 5 messages (design §8's Build step 4: a language section needs that many to be
+ * written); English (the implicit default already in `mail`/`teams`) and "none" never get their
+ * own entry.
+ */
+export function styleFacts(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const mailMsgs = list.filter((m) => m?.channel === 'mail');
+  const teamsMsgs = list.filter((m) => m?.channel === 'chat');
+  const byLangKey = new Map();
+  for (const m of list) {
+    const lang = languageOf(m?.text);
+    if (lang === 'en' || lang === 'none') continue;
+    const bucket = m?.channel === 'mail' ? 'mail' : 'teams';
+    const key = `${bucket}·${lang}`;
+    if (!byLangKey.has(key)) byLangKey.set(key, []);
+    byLangKey.get(key).push(m);
+  }
+  const languages = {};
+  for (const [key, msgs] of byLangKey) {
+    if (msgs.length >= 5) languages[key] = statsOf(msgs);
+  }
+  return { mail: statsOf(mailMsgs), teams: statsOf(teamsMsgs), languages };
+}
+
+/**
+ * `aiSamples(messages)`: at most 40 of `messages`, newest first (the order `sent` already gives),
+ * each cut to 1,500 characters with e-mail addresses and phone numbers removed and every name in
+ * `to` replaced by "the recipient" (design §8 step 3) -> `[{channel, text}]`.
+ */
+export function aiSamples(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  for (const m of list) {
+    if (out.length >= 40) break;
+    let text = String(m?.text ?? '');
+    if (!text.trim()) continue;
+    const names = String(m?.to ?? '').split(',').map((n) => n.trim()).filter(Boolean);
+    for (const name of names) {
+      text = text.replaceAll(name, 'the recipient');
+    }
+    text = text.replace(EMAIL_RE, '').replace(PHONE_RE, '');
+    text = cut(text.trim(), 1500);
+    if (!text) continue;
+    out.push({ channel: m?.channel === 'mail' ? 'mail' : 'teams', text });
+  }
+  return out;
+}
+
+function proseOf(stats, label) {
+  if (!stats || !stats.count) return `No ${label.toLowerCase()} messages were available yet.`;
+  const bits = [`Typically about ${stats.typicalWords} words.`];
+  bits.push(stats.greeting ? `Often opens with "${stats.greeting}".` : 'No common greeting found.');
+  bits.push(stats.signoff ? `Often signs off with "${stats.signoff}".` : 'No common sign-off found.');
+  bits.push(stats.lowerCaseStart ? 'Often starts in lower case.' : 'Usually starts with a capital letter.');
+  bits.push(stats.emoji ? 'Uses emoji sometimes.' : 'Rarely uses emoji.');
+  bits.push(stats.exclamation ? 'Uses exclamation marks sometimes.' : 'Rarely uses exclamation marks.');
+  return bits.join(' ');
+}
+
+function buildAiPrompt(samples) {
+  const lines = samples.map((s) => `[${s.channel}] ${s.text}`).join('\n---\n');
+  return [
+    'These are short samples of messages someone sent. In at most 12 short lines, describe how',
+    'they write: length, tone, habits. Quote at most five words at a time, and never name anyone.',
+    '',
+    lines,
+  ].join('\n');
+}
+
+async function buildImpl(ctx, args = {}) {
+  const root = requireRoot(ctx);
+  const entries = await listDirsOrThrow(ctx, root);
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
+    ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
+  const rel = `${voiceFolder}/style.md`;
+
+  const current = await safeRead(ctx, root, rel);
+  const sha = current === null ? null : ctx.crypto.sha256(current);
+  const { front, body: currentBody } = current === null
+    ? { front: {}, body: '' }
+    : parseFrontmatter(current);
+  const recordedBuilt = front && front.built ? String(front.built) : null;
+  const bodySha = current !== null && front !== null ? ctx.crypto.sha256(String(currentBody).trim()) : null;
+
+  if (recordedBuilt && bodySha && recordedBuilt !== bodySha && !args.replace) {
+    return { ask: 'Replace the style card you edited?' };
+  }
+
+  const { messages } = await ctx.replyContext.sent({ channel: 'all', days: 90, limit: 200 });
+  const list = Array.isArray(messages) ? messages : [];
+  const facts = styleFacts(list);
+  const mailCount = list.filter((m) => m?.channel === 'mail').length;
+  const teamsCount = list.filter((m) => m?.channel === 'chat').length;
+
+  const sections = [
+    `## Mail\n\n${proseOf(facts.mail, 'Mail')}`,
+    `## Teams\n\n${proseOf(facts.teams, 'Teams')}`,
+  ];
+  for (const [key, stats] of Object.entries(facts.languages ?? {})) {
+    const [bucket, lang] = key.split('·');
+    const label = bucket === 'mail' ? 'Mail' : 'Teams';
+    sections.push(`## ${label} · ${lang}\n\n${proseOf(stats, label)}`);
+  }
+
+  let warning;
+  if (mailCount < 10) {
+    warning = `Only ${mailCount} mail previews were available, so the mail part is thin: previews cut greetings and sign-offs.`;
+  }
+
+  if (args.ai) {
+    const samples = aiSamples(list);
+    const answer = await ctx.claude.run({ prompt: buildAiPrompt(samples), title: 'Knowledge: how you write' });
+    const words = String(answer?.answer ?? '').trim();
+    if (words) sections.push(`## In words\n\n${words}`);
+  }
+
+  const bodyText = sections.join('\n\n');
+  const builtSha = ctx.crypto.sha256(bodyText.trim());
+  const fm = { basedOn: { mail: mailCount, teams: teamsCount }, built: builtSha };
+  const content = `${renderFrontmatter(fm)}${bodyText}\n`;
+  await guardedWrite(ctx, root, rel, content, sha);
+
+  const answer = { style: { text: bodyText, basedOn: fm.basedOn } };
+  if (warning) answer.warning = warning;
+  return answer;
+}
+
+// ------------------------------------------------------------------------------------------------
+// `save`, `remove` (design §1, §8): `save {kind: "style", text}`, `save {kind: "rule", id,
+// applies, text}` and `save {kind: "rules", items}` (the import, every item in one write),
+// `remove {kind: "rule", id}` — each with `ifSha`, so an edit made in the folder meanwhile is
+// never overwritten (design §8, ruling "a refused save keeps the editor text").
+
+async function saveStyleImpl(ctx, root, entries, args) {
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
+    ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
+  const rel = `${voiceFolder}/style.md`;
+  const current = await safeRead(ctx, root, rel);
+  const sha = current === null ? null : ctx.crypto.sha256(current);
+  const { front } = current === null ? { front: {} } : parseFrontmatter(current);
+  const fm = front ?? {};
+  const body = String(args.text ?? '');
+  const content = `${renderFrontmatter(fm)}${body}${body.endsWith('\n') ? '' : '\n'}`;
+  await guardedWrite(ctx, root, rel, content, sha);
+
+  const ownerPage = setting(ctx, 'ownerPage', '');
+  const ownerText = ownerPage ? await safeRead(ctx, root, ownerPage) : null;
+  const parsed = styleOf(content, ownerText, ownerPage || null);
+  return {
+    text: parsed.text,
+    updatedAt: new Date().toISOString(),
+    source: rel,
+    basedOn: parsed.basedOn,
+    head: parsed.head,
+  };
+}
+
+async function saveRuleImpl(ctx, root, entries, args) {
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
+    ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
+  const rel = `${voiceFolder}/rules.md`;
+  const current = await safeRead(ctx, root, rel);
+  const sha = current === null ? null : ctx.crypto.sha256(current);
+  const { preamble, blocks } = parseBlocks(current ?? '');
+
+  const ids = idsOfBlocks(blocks);
+  const heading = headingOf(args.applies);
+  const newLines = String(args.text ?? '').trim().split(/\r\n|\n/);
+
+  const nextBlocks = blocks.map((b) => ({ heading: b.heading, lines: b.lines.slice() }));
+  let targetIndex = args.id ? ids.findIndex((rid) => rid === args.id) : -1;
+  if (targetIndex >= 0) {
+    nextBlocks[targetIndex] = { heading, lines: newLines };
+  } else {
+    nextBlocks.push({ heading, lines: newLines });
+    targetIndex = nextBlocks.length - 1;
+  }
+
+  const finalIds = idsOfBlocks(nextBlocks);
+  const content = renderBlocks(preamble, nextBlocks);
+  await guardedWrite(ctx, root, rel, content, sha);
+
+  return {
+    id: finalIds[targetIndex],
+    applies: args.applies,
+    text: newLines.join('\n').trim(),
+    source: rel,
+    editable: true,
+  };
+}
+
+async function saveRulesImpl(ctx, root, entries, args) {
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
+    ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
+  const rel = `${voiceFolder}/rules.md`;
+  const current = await safeRead(ctx, root, rel);
+  const sha = current === null ? null : ctx.crypto.sha256(current);
+  const { preamble, blocks } = parseBlocks(current ?? '');
+
+  const items = Array.isArray(args.items) ? args.items : [];
+  const today = new Date().toISOString().slice(0, 10);
+  const newBlocks = items.map((it) => ({
+    heading: headingOf(it.applies),
+    lines: [
+      `<!-- imported from skill "${it.from}" on ${today} -->`,
+      ...String(it.text ?? '').trim().split(/\r\n|\n/),
+    ],
+  }));
+
+  const nextBlocks = [...blocks, ...newBlocks];
+  const finalIds = idsOfBlocks(nextBlocks);
+  const content = renderBlocks(preamble, nextBlocks);
+  await guardedWrite(ctx, root, rel, content, sha);
+
+  const savedItems = items.map((it, i) => ({
+    id: finalIds[blocks.length + i],
+    applies: it.applies,
+    text: String(it.text ?? '').trim(),
+    source: rel,
+    editable: true,
+  }));
+  return { items: savedItems };
+}
+
+async function removeRuleImpl(ctx, root, entries, args) {
+  const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER));
+  if (!voiceFolder) return { removed: true };
+  const rel = `${voiceFolder}/rules.md`;
+  const current = await safeRead(ctx, root, rel);
+  if (current === null) return { removed: true };
+  const sha = ctx.crypto.sha256(current);
+  const { preamble, blocks } = parseBlocks(current);
+  const ids = idsOfBlocks(blocks);
+  const idx = ids.findIndex((rid) => rid === args.id);
+  if (idx < 0) return { removed: true };
+  const remaining = blocks.filter((_, i) => i !== idx);
+  const content = renderBlocks(preamble, remaining);
+  await guardedWrite(ctx, root, rel, content, sha);
+  return { removed: true };
+}
+
+// ------------------------------------------------------------------------------------------------
+// The page's host commands (design §8's "Its page"): `pickFolder`, `build`, `newPerson` and
+// `summary`.
+
+async function newPersonImpl(ctx, root, entries, args) {
+  const peopleFolder = matchFolder(entries, setting(ctx, 'peopleFolder', DEFAULT_PEOPLE_FOLDER))
+    ?? setting(ctx, 'peopleFolder', DEFAULT_PEOPLE_FOLDER);
+  const name = String(args?.name ?? '').trim();
+  if (!name) throw new Error('bad_request: A name is needed.');
+  const fileSlug = slug(name) || 'person';
+  const rel = `${peopleFolder}/${fileSlug}.md`;
+  const address = String(args?.address ?? '').trim();
+  const fm = { name };
+  if (address) fm.emails = [address];
+  const content = `${renderFrontmatter(fm)}# ${name}\n`;
+  try {
+    await ctx.fs.write(root, rel, content, { createNew: true });
+  } catch {
+    throw new Error(`refused: There is already a page for "${name}".`);
+  }
+  return { id: fileSlug, name, address: address || null, source: rel };
+}
+
+async function summaryImpl(ctx) {
+  const root = rootOf(ctx);
+  if (!root) return { folder: null, people: 0, peopleWithProfile: 0, rules: 0, style: false };
+  let entries;
+  try {
+    entries = await ctx.fs.list(root, '');
+  } catch {
+    return { folder: root, people: 0, peopleWithProfile: 0, rules: 0, style: false };
+  }
+  const { people } = await readAllPeople(ctx, root, entries);
+  const full = await fullStyleAndRules(ctx, root, entries);
+  return {
+    folder: root,
+    people: people.length,
+    peopleWithProfile: people.filter((p) => p.text).length,
+    rules: full.rules.length,
+    style: Boolean(full.style.text),
+  };
+}
+
+// ------------------------------------------------------------------------------------------------
+// `apply(ctx)`: the host half. Registers the six `reply-context` ops (design §1, §2) and
+// Knowledge's own page commands (design §8). Every op that touches the folder checks it first
+// (`requireRoot`/`listDirsOrThrow`); `facts` reads only this folder, never Connect's copy or any
+// other plugin's.
+export function apply(ctx) {
+  async function status() {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    const { people, skipped } = await readAllPeople(ctx, root, entries);
+    const full = await fullStyleAndRules(ctx, root, entries);
+    return { ok: true, people: people.length, rules: full.rules.length, style: Boolean(full.style.text), skipped };
+  }
+
+  async function doExport() {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    const { people } = await readAllPeople(ctx, root, entries);
+    const full = await fullStyleAndRules(ctx, root, entries);
+    return { style: full.style, rules: full.rules, people };
+  }
+
+  async function context(args = {}) {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    const { people } = await readAllPeople(ctx, root, entries);
+    const full = await fullStyleAndRules(ctx, root, entries);
+    const matched = matchPerson(people, args.person ?? {});
+    return { style: full.style, person: matched ?? null, rules: full.rules };
+  }
+
+  async function facts(args = {}) {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    return searchFacts(ctx, root, entries, args);
+  }
+
+  async function save(args = {}) {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    if (args.kind === 'style') return saveStyleImpl(ctx, root, entries, args);
+    if (args.kind === 'rule') return saveRuleImpl(ctx, root, entries, args);
+    if (args.kind === 'rules') return saveRulesImpl(ctx, root, entries, args);
+    throw new Error('bad_request: Unknown save kind.');
+  }
+
+  async function remove(args = {}) {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    if (args.kind === 'rule') return removeRuleImpl(ctx, root, entries, args);
+    throw new Error('bad_request: Unknown remove kind.');
+  }
+
+  async function build(args = {}) {
+    return buildImpl(ctx, args);
+  }
+
+  async function newPerson(args = {}) {
+    const root = requireRoot(ctx);
+    const entries = await listDirsOrThrow(ctx, root);
+    return newPersonImpl(ctx, root, entries, args);
+  }
+
+  async function summary() {
+    return summaryImpl(ctx);
+  }
+
+  async function pickFolder() {
+    const chosen = await ctx.system.pickFolder('Choose your knowledge folder');
+    return { folder: chosen ?? null };
+  }
+
+  ctx.replyContext.provide({ status, export: doExport, context, facts, save, remove });
+  ctx.command('pickFolder', pickFolder);
+  ctx.command('build', build);
+  ctx.command('newPerson', newPerson);
+  ctx.command('summary', summary);
 }

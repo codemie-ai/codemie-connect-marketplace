@@ -1,8 +1,9 @@
 {
   "name": "codemie",
   "owner": "codemie-ai",
-  "featured": ["todoist"],
+  "featured": ["todoist", "knowledge"],
   "plugins": [
-    { "id": "todoist", "source": "./plugins/todoist", "categories": ["tasks"] }
+    { "id": "todoist", "source": "./plugins/todoist", "categories": ["tasks"] },
+    { "id": "knowledge", "source": "./plugins/knowledge", "categories": ["replies"] }
   ]
 }
