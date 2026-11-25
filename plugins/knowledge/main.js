@@ -538,6 +538,37 @@ async function safeRead(ctx, root, rel) {
   }
 }
 
+// A page Knowledge writes over (Voice/style.md, Voice/rules.md) is read exactly, or not at all:
+// strict UTF-8 within the host's own 1 MB read, so the `ifSha` it writes with is the sha of the
+// bytes on disk. A page it can't read that way is refused with what is wrong and what to do —
+// never written over, and never "The page changed" (a refresh can't help). `null` when there is
+// no page yet. The sentence names the file, never its text (ruling 22).
+const PAGE_READ_MAX = 1 << 20;
+
+async function readPage(ctx, root, rel) {
+  let st;
+  try {
+    st = await ctx.fs.stat(root, rel);
+  } catch {
+    // Its folder isn't there yet (the host's stat resolves the folder first): no page.
+    return null;
+  }
+  if (!st) return null;
+  const cant = (why) => new Error(`refused: Knowledge can't read ${rel}${why}`);
+  if (st.kind !== 'file') throw cant('. Check it in your folder, then try again.');
+  if (st.size > PAGE_READ_MAX) {
+    throw cant(": it's over 1 MB. Make it smaller in your folder, then try again.");
+  }
+  try {
+    return await ctx.fs.read(root, rel, { strict: true });
+  } catch (e) {
+    if (/UTF-8/.test(String(e?.message))) {
+      throw cant(": it isn't UTF-8 text. Save it as UTF-8 in your folder, then try again.");
+    }
+    throw cant('. Check it in your folder, then try again.');
+  }
+}
+
 // Every `ctx.fs.write` conflict Knowledge can hit (the fake's and the real host's own wording
 // differ slightly) becomes this one canned refusal — never the raw error, so a page's own text
 // can never reach it (ruling 22).
@@ -1151,7 +1182,7 @@ async function buildImpl(ctx, args = {}) {
     ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const rel = `${voiceFolder}/style.md`;
 
-  const current = await safeRead(ctx, root, rel);
+  const current = await readPage(ctx, root, rel);
   const sha = current === null ? null : ctx.crypto.sha256(current);
   const { front, body: currentBody } = current === null
     ? { front: {}, body: '' }
@@ -1218,7 +1249,7 @@ async function saveStyleImpl(ctx, root, entries, args) {
   const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
     ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const rel = `${voiceFolder}/style.md`;
-  const current = await safeRead(ctx, root, rel);
+  const current = await readPage(ctx, root, rel);
   const sha = current === null ? null : ctx.crypto.sha256(current);
   const { front } = current === null ? { front: {} } : parseFrontmatter(current);
   const fm = front ?? {};
@@ -1242,7 +1273,7 @@ async function saveRuleImpl(ctx, root, entries, args) {
   const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
     ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const rel = `${voiceFolder}/rules.md`;
-  const current = await safeRead(ctx, root, rel);
+  const current = await readPage(ctx, root, rel);
   const sha = current === null ? null : ctx.crypto.sha256(current);
   const { preamble, blocks } = parseBlocks(current ?? '');
 
@@ -1283,7 +1314,7 @@ async function saveRulesImpl(ctx, root, entries, args) {
   const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER))
     ?? setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER);
   const rel = `${voiceFolder}/rules.md`;
-  const current = await safeRead(ctx, root, rel);
+  const current = await readPage(ctx, root, rel);
   const sha = current === null ? null : ctx.crypto.sha256(current);
   const { preamble, blocks } = parseBlocks(current ?? '');
 
@@ -1316,7 +1347,7 @@ async function removeRuleImpl(ctx, root, entries, args) {
   const voiceFolder = matchFolder(entries, setting(ctx, 'voiceFolder', DEFAULT_VOICE_FOLDER));
   if (!voiceFolder) return { removed: true };
   const rel = `${voiceFolder}/rules.md`;
-  const current = await safeRead(ctx, root, rel);
+  const current = await readPage(ctx, root, rel);
   if (current === null) return { removed: true };
   const sha = ctx.crypto.sha256(current);
   const { preamble, blocks } = parseBlocks(current);

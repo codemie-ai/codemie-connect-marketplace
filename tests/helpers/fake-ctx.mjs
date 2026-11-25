@@ -17,6 +17,10 @@ import { createHash } from 'node:crypto';
 
 const sha256 = (text) => createHash('sha256').update(String(text)).digest('hex');
 
+// `fs.rs`'s read limits: 1 MB without `max`, never more than 4 MB.
+const READ_DEFAULT = 1 << 20;
+const READ_MAX = 4 << 20;
+
 export function fakeCtx({
   settings = {},
   fetchHandler,
@@ -140,7 +144,21 @@ export function fakeCtx({
       folders: () => [root],
       list: (_root, relPath = '') => readdirSync(toAbs(relPath), { withFileTypes: true })
         .map((e) => ({ name: e.name, dir: e.isDirectory() })),
-      read: (_root, rel) => readFileSync(toAbs(rel), 'utf8'),
+      // As `fs.rs`'s `read_text`: 1 MB unless `max` asks for more (never over 4 MB); lossy
+      // UTF-8 unless `{strict: true}`, which refuses `not UTF-8: <rel>` (an unfinished character
+      // at the very end of a cut read is dropped, not refused).
+      read: (_root, rel, o) => {
+        const asked = typeof o === 'number' ? o : o?.max;
+        const max = Math.min(asked > 0 ? asked : READ_DEFAULT, READ_MAX);
+        const bytes = readFileSync(toAbs(rel));
+        const buf = bytes.subarray(0, max);
+        if (!o?.strict) return buf.toString('utf8');
+        try {
+          return new TextDecoder('utf-8', { fatal: true }).decode(buf, { stream: bytes.length > max });
+        } catch {
+          throw new Error(`not UTF-8: ${rel}`);
+        }
+      },
       readMany: async (_root, rels = []) => rels.map((rel) => {
         try {
           return readFileSync(toAbs(rel), 'utf8');

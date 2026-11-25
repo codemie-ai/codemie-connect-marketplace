@@ -227,6 +227,33 @@ test('save_refuses_when_the_page_changed', async () => {
   );
 });
 
+// Review (task 13): a page Knowledge can't read exactly — bytes that aren't UTF-8, or over the
+// host's 1 MB read — is never overwritten, and the refusal says what is wrong and what to do,
+// never "The page changed" (a refresh can't help).
+test('a page that is not UTF-8 or over 1 MB is never overwritten: every save, remove and build refuses plainly', async () => {
+  const notUtf8 = (rel) => `refused: Knowledge can't read ${rel}: it isn't UTF-8 text. Save it as UTF-8 in your folder, then try again.`;
+  const tooBig = (rel) => `refused: Knowledge can't read ${rel}: it's over 1 MB. Make it smaller in your folder, then try again.`;
+  const cases = [
+    ['Voice/rules.md', (ctx) => ctx.run('save', { kind: 'rule', id: null, applies: { kind: 'everyone' }, text: 'Be brief.' })],
+    ['Voice/rules.md', (ctx) => ctx.run('save', { kind: 'rules', items: [{ applies: { kind: 'everyone' }, text: 'Be brief.', from: 'reply-style' }] })],
+    ['Voice/rules.md', (ctx) => ctx.run('remove', { kind: 'rule', id: 'everyone' })],
+    ['Voice/style.md', (ctx) => ctx.run('save', { kind: 'style', text: 'Plain words.' })],
+    ['Voice/style.md', (ctx) => ctx.run('build', { ai: false, replace: true })],
+  ];
+  for (const [rel, act] of cases) {
+    for (const [bytes, message] of [
+      [Buffer.concat([Buffer.from('## everyone\nCaf'), Buffer.from([0xe9]), Buffer.from(' rules.\n')]), notUtf8(rel)],
+      [Buffer.from(`## everyone\n${'a'.repeat(1 << 20)}\n`), tooBig(rel)],
+    ]) {
+      const { ctx, root } = setup();
+      mkdirSync(join(root, 'Voice'), { recursive: true });
+      writeFileSync(join(root, rel), bytes);
+      await assert.rejects(() => act(ctx), (e) => e.message === message, `${rel}: ${message}`);
+      assert.ok(readFileSync(join(root, rel)).equals(bytes), `${rel} is unchanged`);
+    }
+  }
+});
+
 test('remove deletes a rule section; removing one already gone answers removed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'knowledge-remove-'));
   write(dir, 'Voice/rules.md', RULES_TEXT);
