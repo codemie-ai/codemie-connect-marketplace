@@ -131,6 +131,20 @@ test('snippetOf falls back to the matched heading’s own lines, or the body’s
   assert.ok(longTitle.title.length <= 120);
 });
 
+// Found running the real plugin in Connect's host: a page whose term sits only in its "# " title
+// gave the title line itself as its text (the title twice, nothing to ground a draft); the title
+// is never a body line, so the fallback's first lines are given instead.
+test('snippetOf never gives the "# " title as the text of an H1-only match', () => {
+  const page = {
+    path: 'projects/atlas-rollout.md',
+    text: ['---', 'aliases: [Atlas]', '---', '# Atlas Rollout', '', '## Dates', 'Go-live moved to 2026-12-08.'].join('\n'),
+  };
+  const snip = snippetOf(page, ['Atlas Rollout']);
+  assert.equal(snip.title, 'Atlas Rollout');
+  assert.ok(!snip.text.includes('# Atlas Rollout'), snip.text);
+  assert.ok(snip.text.includes('Go-live moved to 2026-12-08.'), snip.text);
+});
+
 // Review I3's own suggested fix: when a page truly has no text to give (an alias-only match on
 // an otherwise-empty page), it is skipped rather than handed back as an empty fact — a
 // lower-ranked, populated page takes its slot instead.

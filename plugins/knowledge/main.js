@@ -845,7 +845,8 @@ export function snippetOf(page, terms) {
       continue;
     }
     const line = rawLine.trim();
-    if (!line) continue;
+    // The "# " title is the fact's `title`, never a line of its text.
+    if (!line || /^#\s/.test(line)) continue;
     const folded = foldText(line);
     if (termsFolded.some((t) => wordIncludes(folded, t))) {
       if (heading && heading !== lastEmitted) {
