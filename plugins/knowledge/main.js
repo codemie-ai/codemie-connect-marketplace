@@ -1,16 +1,18 @@
 // Knowledge: Connect's `reply-context` provider for a folder of plain Markdown (design
 // `docs/superpowers/specs/2026-11-25-reply-voice-design.md` §8, rulings 16, 17, 25, 26, 39). The
 // folder can be the user's existing knowledge base, so reading is deliberately loose: a page is a
-// person once its frontmatter parses, however little it says; a page's writing-profile is never
-// its whole body, only the named sections the user configured, best first; a page with no
-// frontmatter block at all is still readable (an empty frontmatter), only a frontmatter block
-// that opens and never closes (or whose YAML the small parser below can't read) makes a page
-// unreadable, so it is skipped rather than guessed at.
+// person however little its frontmatter says; ordinary YAML another tool writes is read for the
+// fields Knowledge needs and the rest is skipped; a page's writing-profile is never its whole
+// body, only the named sections the user configured, best first; a page with no frontmatter
+// block at all is still readable (an empty frontmatter). Only a frontmatter block that opens and
+// never closes makes a page unreadable: it is skipped rather than guessed at, and counted.
 //
-// This file is the pure half: no file is opened here, no git is run, nothing is written. The
-// functions below take text Connect (or a test) already read and answer plain data; `apply(ctx)`
-// — the host half that walks the folder and registers `ctx.replyContext.provide({...})` — is a
-// later task's job and is left empty here on purpose.
+// Each section keeps its pure functions (text already read in, plain data out: the frontmatter
+// reader, people, rules, the style card, facts scoring, the style facts) next to the host code
+// that uses them. The host half ends in `apply(ctx)`: it reads the granted folder through
+// `ctx.fs`, registers the six ops with `ctx.replyContext.provide({...})` and Knowledge's own page
+// commands, and writes only in the Voice folder (and a new person page), each write guarded by
+// `ifSha` or `createNew`.
 
 // ------------------------------------------------------------------------------------------------
 // A small, deterministic, lenient YAML-frontmatter reader: enough for a person page's `id`,
