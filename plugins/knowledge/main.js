@@ -458,6 +458,22 @@ function withoutCommentLines(text) {
     .trim();
 }
 
+// A rule text line that would read as a "## " heading is written with one more leading
+// backslash (`\## …`), so a saved text can never start a new section or rule; reading takes one
+// off again, so the text reads back as typed (an already escaped line round-trips too).
+const HEADING_LIKE = /^(\\*)(##\s)/;
+
+function escapeRuleLines(lines) {
+  return lines.map((line) => line.replace(HEADING_LIKE, '\\$1$2'));
+}
+
+function unescapeRuleText(text) {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/^\\(\\*##\s)/, '$1'))
+    .join('\n');
+}
+
 /**
  * `ruleId(heading, taken)`: a slug of the heading, made unique against the ids already `taken`
  * (a `Set`) by appending `-2`, `-3`, …. Pure: the caller adds the id it gets back to `taken`
@@ -487,7 +503,7 @@ export function parseRules(text) {
     const applies = { kind: scope.kind };
     if (scope.value !== undefined) applies.value = scope.value;
     if (scope.channel) applies.channel = scope.channel;
-    rules.push({ id, applies, text: withoutCommentLines(body) });
+    rules.push({ id, applies, text: unescapeRuleText(withoutCommentLines(body)) });
   }
   return rules;
 }
@@ -846,7 +862,8 @@ function headingOf(applies = {}) {
   let h;
   if (applies.kind === 'no-profile') h = 'no-profile';
   else if (applies.kind === 'everyone') h = 'everyone';
-  else h = `${applies.kind}: ${applies.value}`;
+  // A line break in the value would end the heading and start a new section on read-back.
+  else h = `${applies.kind}: ${String(applies.value ?? '').replace(/\s+/g, ' ').trim()}`;
   if (applies.channel) h += ` · ${applies.channel}`;
   return h;
 }
@@ -1426,9 +1443,9 @@ async function saveRuleImpl(ctx, root, entries, args) {
   const nextBlocks = blocks.map((b) => ({ heading: b.heading, lines: b.lines.slice() }));
   let targetIndex = args.id ? ids.findIndex((rid) => rid === args.id) : -1;
   if (targetIndex >= 0) {
-    nextBlocks[targetIndex] = { heading, lines: newLines };
+    nextBlocks[targetIndex] = { heading, lines: escapeRuleLines(newLines) };
   } else {
-    nextBlocks.push({ heading, lines: newLines });
+    nextBlocks.push({ heading, lines: escapeRuleLines(newLines) });
     targetIndex = nextBlocks.length - 1;
   }
 
@@ -1459,7 +1476,7 @@ async function saveRulesImpl(ctx, root, entries, args) {
     heading: headingOf(it.applies),
     lines: [
       `<!-- imported from skill "${it.from}" on ${today} -->`,
-      ...String(it.text ?? '').trim().split(/\r\n|\n/),
+      ...escapeRuleLines(String(it.text ?? '').trim().split(/\r\n|\n/)),
     ],
   }));
 

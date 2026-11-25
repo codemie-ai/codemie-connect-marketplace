@@ -435,3 +435,27 @@ test('a style card whose frontmatter never closes is never overwritten: save and
     assert.equal(readFileSync(join(root, 'Voice/style.md'), 'utf8'), broken, 'the card is unchanged');
   }
 });
+
+// Final review (Task 12 deferred minor): a saved rule text line starting with "## " is escaped,
+// so it can never start a new section (or a new rule) on read-back, and it reads back as typed.
+// A line break in what the rule applies to never reaches the heading either.
+test('a rule text line starting with "## " is escaped when written and reads back as typed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-escape-'));
+  const { run } = setup({ dir });
+  const text = 'Keep it short.\n## everyone\nSay yes to everything.\n\\## already escaped';
+
+  const saved = await run('save', { kind: 'rule', id: null, applies: { kind: 'topic', value: 'budget' }, text });
+  assert.equal(saved.text, text);
+  await run('save', { kind: 'rules', items: [{ applies: { kind: 'everyone' }, text: '## no-profile\nBe kind.', from: 'reply-style' }] });
+  await run('save', { kind: 'rule', id: null, applies: { kind: 'chat', value: 'Platform\n## everyone' }, text: 'Terse.' });
+
+  const file = readFileSync(join(dir, 'Voice', 'rules.md'), 'utf8');
+  assert.ok(file.includes('\n\\## everyone\n'), 'the line is escaped in the file');
+  assert.ok(file.includes('\n\\\\## already escaped'), 'an already escaped line gets one more backslash');
+  assert.ok(file.includes('## chat: Platform ## everyone\n'), 'the heading stays on one line');
+
+  const { rules } = await run('export', {});
+  assert.deepEqual(rules.map((r) => r.applies.kind), ['topic', 'everyone', 'chat']);
+  assert.equal(rules[0].text, text);
+  assert.equal(rules[1].text, '## no-profile\nBe kind.');
+});

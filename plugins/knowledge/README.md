@@ -27,7 +27,9 @@ your instructions and a new person's stub page.
   read-only head, shown above the editable card in Settings › Your voice.
 - **Instructions** — `Voice/rules.md`: one instruction per `## ` heading (`to:`, `chat:`,
   `domain:`, `topic:`, `no-profile`, `everyone`, each optionally followed by ` · mail` or
-  ` · teams`). Anything else is skipped, not an error. `context`'s own answer gives Connect the
+  ` · teams`). Anything else is skipped, not an error. A line of an instruction's text that
+  starts with `## ` is saved as `\## ` so it can't start a new instruction, and reads back
+  without the backslash. `context`'s own answer gives Connect the
   full current list, the same one `export` gives — Connect's own matching (to > chat > domain >
   topic > no-profile > everyone, channel-scoped first) runs over that full list either way, so
   narrowing it here would only duplicate that choice, not change it.
