@@ -415,3 +415,36 @@ test('a folded block scalar that starts with a blank line keeps no leading break
   const { front } = parseFrontmatter(['---', 'long: >-', '', '  para one', '', '  para two', '---'].join('\n'));
   assert.equal(front.long, 'para one\npara two');
 });
+
+// Re-review: hostile frontmatter never throws and never takes long. Deep nesting past the cap
+// and an over-long line make only that page unreadable.
+test('3,000 nested brackets make the page unreadable, never a thrown RangeError', () => {
+  const text = ['---', `k: ${'['.repeat(3000)}${']'.repeat(3000)}`, 'name: Deep', '---', '# Deep'].join('\n');
+  assert.doesNotThrow(() => parseFrontmatter(text));
+  assert.equal(personOf('People/deep.md', text, SETTINGS, {}), null);
+  // Under the line cap, so the depth cap itself is what stops it: inline and block nesting.
+  const inline = ['---', `k: ${'['.repeat(1900)}${']'.repeat(1900)}`, '---'].join('\n');
+  assert.equal(parseFrontmatter(inline).front, null);
+  const block = ['---', ...Array.from({ length: 40 }, (_, i) => `${'  '.repeat(i)}k${i}:`), `${'  '.repeat(40)}v`, '---'].join('\n');
+  assert.equal(parseFrontmatter(block).front, null);
+});
+
+test('a 200 KB line of spaces, or of "a a a …:", parses in under 100 ms; so does a line just under the cap', () => {
+  for (const n of [200 * 1024, 3900]) {
+    const sp = ' '.repeat(n);
+    for (const line of [sp, `${'a '.repeat(n / 2)}:`, `k: x${sp}y`, `a${sp}b: c`, `k: [x${sp}y]`, `k: {a: x${sp}y}`]) {
+      const text = ['---', line, 'name: X', '---'].join('\n');
+      const started = performance.now();
+      const { front } = parseFrontmatter(text);
+      const took = performance.now() - started;
+      assert.ok(took < 100, `${n}: took ${took} ms`);
+      if (n > 4000 && line.trim()) assert.equal(front, null, 'a line over 4,000 characters makes the page unreadable');
+    }
+  }
+});
+
+test('nesting up to the cap still reads', () => {
+  const { front } = parseFrontmatter(['---', 'k: [[[a]]]', 'm:', '  n:', '    o: deep', '---'].join('\n'));
+  assert.deepEqual(front.k, [[['a']]]);
+  assert.deepEqual(front.m, { n: { o: 'deep' } });
+});

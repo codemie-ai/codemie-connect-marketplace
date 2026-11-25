@@ -459,3 +459,14 @@ test('a rule text line starting with "## " is escaped when written and reads bac
   assert.equal(rules[0].text, text);
   assert.equal(rules[1].text, '## no-profile\nBe kind.');
 });
+
+test('one hostile people page is skipped and named; the folder still lists its other people', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-hostile-'));
+  write(dir, 'People/priya-n.md', PERSON_PRIYA);
+  write(dir, 'People/deep.md', ['---', `k: ${'['.repeat(3000)}${']'.repeat(3000)}`, '---', '# Deep'].join('\n'));
+  const { run } = setup({ dir });
+  assert.deepEqual(await run('status', {}), { ok: true, people: 1, rules: 0, style: false, skipped: 1 });
+  const summary = await run('summary', {});
+  assert.deepEqual(summary.unreadable, ['People/deep.md']);
+  assert.equal((await run('export', {})).people.length, 1);
+});

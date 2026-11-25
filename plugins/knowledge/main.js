@@ -23,10 +23,19 @@
 // giving up on the page. Never a full YAML parser: no anchors, tags or multi-document streams.
 
 const FENCE = /^---\s*$/;
-const KEY_LINE = /^("[^"]*"|'[^']*'|[A-Za-z_][\w .-]*?)\s*:(?:\s+(.*)|$)/;
+// Key words joined by single spaces, so the key never overlaps the `\s*:` after it (linear).
+const KEY_LINE = /^("[^"]*"|'[^']*'|[A-Za-z_][\w.-]*(?: [\w.-]+)*)\s*:(?:\s+(.*)|$)/;
 const KEY_TIGHT = /^([A-Za-z_][\w.-]*):(\S.*)$/;
 const BLOCK_SCALAR = /^([|>])([+-]?)\d*([+-]?)\s*(?:#.*)?$/;
 const LIST_ITEM = /^-(?:\s|$)/;
+// A frontmatter nested deeper than this, or with a line longer than this, makes the page
+// unreadable: hostile input must never overflow the stack or take long.
+const MAX_DEPTH = 16;
+const MAX_LINE = 4000;
+
+function tooDeep(depth) {
+  if (depth > MAX_DEPTH) throw new Error('frontmatter nested too deep');
+}
 
 function indentOf(line) {
   const at = line.search(/\S/);
@@ -49,7 +58,15 @@ function unquote(raw) {
     const close = t.indexOf(q, 1);
     if (close > 0 && /^\s*(?:#.*)?$/.test(t.slice(close + 1))) return t.slice(1, close);
   }
-  return t.replace(/\s+#.*$/, '');
+  return withoutComment(t);
+}
+
+// `t` without a trailing ` # comment` (a `#` after whitespace), in one linear scan.
+function withoutComment(t) {
+  for (let i = 1; i < t.length; i += 1) {
+    if (t[i] === '#' && /\s/.test(t[i - 1])) return t.slice(0, i).trimEnd();
+  }
+  return t;
 }
 
 // A bare scalar: null/blank, a bool, else the (unquoted) string as written — deliberately never a
@@ -79,7 +96,7 @@ function splitFlow(inner) {
       if (ch === quote) quote = null;
       continue;
     }
-    if ((ch === '"' || ch === "'") && /(?:^|:)\s*$/.test(cur)) quote = ch;
+    if ((ch === '"' || ch === "'") && /^$|:$/.test(cur.trimEnd())) quote = ch;
     else if (ch === '[' || ch === '{') depth += 1;
     else if (ch === ']' || ch === '}') depth -= 1;
     if (ch === ',' && depth === 0) {
@@ -95,15 +112,16 @@ function splitFlow(inner) {
 
 // One value written on a line: `[a, b]`, `{a: 1}` (nested either way), else a scalar. A pair of
 // an inline map with no `:` is skipped, not fatal.
-function valueOf(raw) {
+function valueOf(raw, depth = 0) {
+  tooDeep(depth);
   const t = raw.trim();
-  if (t.startsWith('[') && t.endsWith(']')) return splitFlow(t.slice(1, -1)).map(valueOf);
+  if (t.startsWith('[') && t.endsWith(']')) return splitFlow(t.slice(1, -1)).map((v) => valueOf(v, depth + 1));
   if (t.startsWith('{') && t.endsWith('}')) {
     const out = {};
     for (const pair of splitFlow(t.slice(1, -1))) {
       const m = KEY_LINE.exec(pair.trim()) ?? KEY_TIGHT.exec(pair.trim());
       if (!m) continue;
-      setKey(out, unquote(m[1]), valueOf(m[2] ?? ''));
+      setKey(out, unquote(m[1]), valueOf(m[2] ?? '', depth + 1));
     }
     return out;
   }
@@ -137,23 +155,25 @@ function blockScalarOf(style, chomp, all) {
 }
 
 // A key's value from what follows its colon (`rest`) and its indented child lines.
-function blockValueOf(rest, children) {
+function blockValueOf(rest, children, depth) {
+  tooDeep(depth);
   while (children.length && children[children.length - 1].trim() === '') children.pop();
   const kids = dedent(children);
   const block = BLOCK_SCALAR.exec(rest);
   if (block) return blockScalarOf(block[1], block[2] || block[3], kids);
   if (rest.trim() !== '' && !rest.trim().startsWith('#')) {
     // A flow list or a plain scalar that wraps onto indented lines.
-    return valueOf([rest, ...kids.map((l) => l.trim())].filter(Boolean).join(' '));
+    return valueOf([rest, ...kids.map((l) => l.trim())].filter(Boolean).join(' '), depth);
   }
   const first = kids.find((l) => l.trim() !== '' && !l.trimStart().startsWith('#'));
   if (first === undefined) return null;
-  return LIST_ITEM.test(first) ? listOf(kids) : mapOf(kids);
+  return LIST_ITEM.test(first) ? listOf(kids, depth + 1) : mapOf(kids, depth + 1);
 }
 
 // A block list's (dedented) lines: each `- ` item with the more-indented lines after it. An item
 // that starts with `key:` is a map (a list of maps); a bare `-` takes its block below.
-function listOf(lines) {
+function listOf(lines, depth) {
+  tooDeep(depth);
   const out = [];
   let i = 0;
   while (i < lines.length) {
@@ -172,11 +192,11 @@ function listOf(lines) {
       j += 1;
     }
     if (first.trim() === '' || first.trimStart().startsWith('#')) {
-      out.push(blockValueOf('', cont));
+      out.push(blockValueOf('', cont, depth + 1));
     } else if (!/^["'[{]/.test(first) && KEY_LINE.test(first)) {
-      out.push(mapOf(dedent([`${' '.repeat(pad)}${first}`, ...cont])));
+      out.push(mapOf(dedent([`${' '.repeat(pad)}${first}`, ...cont]), depth + 1));
     } else {
-      out.push(blockValueOf(first, cont));
+      out.push(blockValueOf(first, cont, depth + 1));
     }
     i = j;
   }
@@ -185,7 +205,8 @@ function listOf(lines) {
 
 // A block map's (dedented) lines -> an object. A line at the map's own indent that isn't
 // `key: value` is skipped with its children; nothing here makes the whole page unreadable.
-function mapOf(lines) {
+function mapOf(lines, depth = 0) {
+  tooDeep(depth);
   const out = {};
   let i = 0;
   while (i < lines.length) {
@@ -210,15 +231,15 @@ function mapOf(lines) {
         break;
       }
     }
-    if (m) setKey(out, unquote(m[1]), blockValueOf(rest, children));
+    if (m) setKey(out, unquote(m[1]), blockValueOf(rest, children, depth + 1));
     i = j;
   }
   return out;
 }
 
 // `text` -> `{front, body}`. No opening `---` line at all: an empty, valid frontmatter (a plain
-// knowledge-base page is still readable). Only an opening `---` with no closing one makes
-// `front` `null` — unreadable, the caller skips (and counts) the page; YAML lines the reader
+// knowledge-base page is still readable). Only an opening `---` with no closing one, a line over
+// MAX_LINE or nesting past MAX_DEPTH makes `front` `null` — unreadable, the caller skips (and counts) the page; YAML lines the reader
 // doesn't understand are skipped, never fatal.
 export function parseFrontmatter(text) {
   const src = String(text ?? '');
@@ -234,7 +255,15 @@ export function parseFrontmatter(text) {
     }
   }
   if (end < 0) return { front: null, body: src };
-  const front = mapOf(dedent(lines.slice(1, end)));
+  const block = lines.slice(1, end);
+  if (block.some((l) => l.length > MAX_LINE)) return { front: null, body: src };
+  let front;
+  try {
+    front = mapOf(dedent(block));
+  } catch {
+    // Nested past MAX_DEPTH (or anything else the reader can't survive): unreadable, never fatal.
+    return { front: null, body: src };
+  }
   return { front, body: lines.slice(end + 1).join('\n') };
 }
 
@@ -769,7 +798,12 @@ async function readAllPeople(ctx, root, entries) {
   const unreadable = [];
   for (const f of capped) {
     const text = await safeRead(ctx, root, f.path);
-    const person = text === null ? null : personOf(f.path, text, settingsObj, ids);
+    let person = null;
+    try {
+      if (text !== null) person = personOf(f.path, text, settingsObj, ids);
+    } catch {
+      // One page the reader can't survive is unreadable; the rest of the folder still reads.
+    }
     if (person) {
       people.push(person);
     } else {
@@ -1114,7 +1148,12 @@ async function searchFacts(ctx, root, entries, args) {
     if (Date.now() > deadline) break;
     const text = await safeRead(ctx, root, f.path);
     if (text === null) continue;
-    const result = scorePage({ path: f.path, text }, terms);
+    let result = null;
+    try {
+      result = scorePage({ path: f.path, text }, terms);
+    } catch {
+      continue;
+    }
     if (!result) continue;
     scored.push({ path: f.path, text, ...result });
   }
