@@ -29,11 +29,14 @@ function unquote(raw) {
   return t;
 }
 
-// A bare scalar: null/blank, a number, a bool, else the (unquoted) string as written.
+// A bare scalar: null/blank, a bool, else the (unquoted) string as written — deliberately never a
+// JS `Number`, even for digit-only text: an id (a Teams id, a frontmatter `id`) is opaque text,
+// and a `Number` round-trip silently rounds anything past `Number.MAX_SAFE_INTEGER` (review fix
+// round 1). `basedOn`'s counts are the one place a number is wanted, and `styleOf` converts them
+// itself with `Number(...)`, which works the same over a string or a bare number either way.
 function scalarOf(raw) {
   const t = raw.trim();
   if (t === '' || t === '~' || t.toLowerCase() === 'null') return null;
-  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
   if (t === 'true') return true;
   if (t === 'false') return false;
   return unquote(t);
@@ -188,11 +191,15 @@ function foldHeading(h) {
 
 // A part cut from its end at a line break, with "…", never mid-word — the same rule Connect's own
 // budget cuts use (design §4), applied here only where §8 names a limit of its own (a person's
-// `about`, ≤ 2,000).
+// `about`, ≤ 2,000). Cuts at whichever of the last line break or the last space is closer to the
+// limit: a single matched section with no internal line break at all (review fix round 1) still
+// backs off to its last word boundary, instead of a line break found so early (a heading's own
+// blank line, say) that backing off to it would throw away nearly the whole cut part. Only a
+// single unbroken run with no space and no line break at all falls back to a hard cut.
 function cut(text, limit) {
   if (text.length <= limit) return text;
   const slice = text.slice(0, limit);
-  const at = slice.lastIndexOf('\n');
+  const at = Math.max(slice.lastIndexOf('\n'), slice.lastIndexOf(' '));
   const base = (at > 0 ? slice.slice(0, at) : slice).trimEnd();
   return `${base}…`;
 }
@@ -250,19 +257,25 @@ export function personOf(path, text, settings = {}, ids = {}) {
 
   const names = [...new Set([...aliases, h1].filter((n) => n && String(n).trim() !== ''))];
 
+  // Dedup on the *string* form, not the YAML scalar's own type (review fix round 1): a numeric-
+  // looking id can arrive as a bare number from one source and a string from another (`Voice/
+  // ids.json` is always JSON strings), and `Set` treats `123` and `"123"` as distinct unless the
+  // values are normalized first.
   const emails = Array.isArray(front.emails) ? front.emails : (front.emails ? [front.emails] : []);
   const singleEmail = front.email ? [front.email] : [];
-  const addresses = [...new Set([...emails, ...singleEmail])]
-    .filter((a) => a !== null && a !== undefined && String(a).trim() !== '')
-    .map(String)
-    .slice(0, 10);
+  const addresses = [...new Set(
+    [...emails, ...singleEmail]
+      .filter((a) => a !== null && a !== undefined && String(a).trim() !== '')
+      .map(String),
+  )].slice(0, 10);
 
   const teamsIds = Array.isArray(front.teamsIds) ? front.teamsIds : [];
   const fromIdsFile = ids && Array.isArray(ids[fileSlug]) ? ids[fileSlug] : [];
-  const personIds = [...new Set([...teamsIds, ...fromIdsFile])]
-    .filter((i) => i !== null && i !== undefined && String(i).trim() !== '')
-    .map(String)
-    .slice(0, 10);
+  const personIds = [...new Set(
+    [...teamsIds, ...fromIdsFile]
+      .filter((i) => i !== null && i !== undefined && String(i).trim() !== '')
+      .map(String),
+  )].slice(0, 10);
 
   const sections = sectionsOf(body);
   const profileText = joinSections(sectionsNamed(sections, settings.profileSections));
@@ -368,7 +381,12 @@ const HEAD_SECTIONS = 'Communication Preferences, Communication Style, Writing s
  */
 export function styleOf(text, ownerText, ownerPath) {
   const { front, body } = parseFrontmatter(String(text ?? ''));
-  const fm = front ?? {};
+  // A broken (opened-but-never-closed) frontmatter is unreadable the same way personOf treats it:
+  // parseFrontmatter then hands back the *whole* original text as `body` (fence included), so
+  // without this check a broken style card would leak its raw "---"/frontmatter lines as if they
+  // were the style text itself (review fix round 1).
+  const readable = front !== null;
+  const fm = readable ? front : {};
   const rawBasedOn = fm.basedOn;
   const basedOn = (rawBasedOn && typeof rawBasedOn === 'object' && !Array.isArray(rawBasedOn))
     ? { mail: Number(rawBasedOn.mail) || 0, teams: Number(rawBasedOn.teams) || 0 }
@@ -382,7 +400,7 @@ export function styleOf(text, ownerText, ownerPath) {
     if (headText) head = { text: headText, source: ownerPath ?? null };
   }
 
-  return { text: body.trim(), basedOn, built, head };
+  return { text: readable ? body.trim() : '', basedOn, built, head };
 }
 
 // ------------------------------------------------------------------------------------------------

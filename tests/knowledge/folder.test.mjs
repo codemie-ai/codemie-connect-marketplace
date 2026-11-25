@@ -187,6 +187,55 @@ test('a page with broken frontmatter is skipped', () => {
   assert.equal(parseFrontmatter(text).front, null);
 });
 
+// Review fix round 1: a bare digit-only scalar must never be coerced to a JS Number — a Teams id
+// is an opaque string, and a Number round-trip silently corrupts one past Number.MAX_SAFE_INTEGER.
+test('a Teams id longer than Number.MAX_SAFE_INTEGER is kept exact, never rounded', () => {
+  const longId = '19999999999999999999'; // 20 digits: well past 2^53, would round as a float
+  const text = ['---', 'id: dana-k', `teamsIds: [${longId}]`, '---', '# Dana K'].join('\n');
+  const person = personOf('People/dana-k.md', text, SETTINGS, {});
+  assert.deepEqual(person.ids, [longId]);
+  assert.equal(typeof person.ids[0], 'string');
+});
+
+// Review fix round 1: ids/addresses must dedupe on their string form, not on the YAML scalar's
+// own type — a numeric-looking id can arrive as a bare number from the frontmatter and as a
+// string from Voice/ids.json, and the two must still collapse to one entry.
+test('a numeric id duplicated between the front matter and Voice/ids.json dedupes to one', () => {
+  const text = ['---', 'id: evan-r', 'teamsIds: [778899001122]', '---', '# Evan R'].join('\n');
+  const person = personOf('People/evan-r.md', text, SETTINGS, { 'evan-r': ['778899001122'] });
+  assert.deepEqual(person.ids, ['778899001122']);
+});
+
+// Review fix round 1 (minor): `cut`'s own comment promises "never mid-word"; a single matched
+// about-section with no internal line break at all must still back off to a word boundary instead
+// of hard-truncating at exactly 2,000 characters.
+test('about backs off to the last space, never cutting a word in half, when the matched section has no internal line break', () => {
+  const words = Array(400).fill('alphabet').join(' '); // one unbroken line, far over the 2,000 cap
+  const text = ['---', 'id: wordy', '---', '# Wordy', '## Overview', words].join('\n');
+  const person = personOf('People/wordy.md', text, SETTINGS, {});
+  assert.ok(person.about.endsWith('…'));
+  assert.ok(
+    person.about.length > 1900,
+    `should cut near the 2,000 limit, not fold back to the heading's own blank line: ${person.about.length}`,
+  );
+  const body = person.about.replace(/^## Overview\n\n/, '').slice(0, -1);
+  for (const w of body.split(/\s+/).filter(Boolean)) {
+    assert.equal(w, 'alphabet', `found a partial word: "${w}"`);
+  }
+});
+
+// Review fix round 1 (minor): a broken (unclosed) Voice/style.md frontmatter must be treated as
+// unreadable, the way personOf treats the same condition — never leaking the raw, un-parsed
+// frontmatter text as if it were the style card's own text.
+test('styleOf treats a broken Voice/style.md frontmatter as unreadable, never leaking its raw text', () => {
+  const broken = ['---', 'basedOn: {mail: 12, teams: 140}', 'Keep replies short. (frontmatter never closes)'].join('\n');
+  const result = styleOf(broken, null, null);
+  assert.equal(result.text, '', 'the raw, unclosed frontmatter is never surfaced as the style card');
+  assert.equal(result.basedOn, null);
+  assert.equal(result.built, null);
+  assert.equal(result.head, null);
+});
+
 test('style: frontmatter basedOn {mail, teams} and built; a bare basedOn number reads as null; the owner page sections become the head', () => {
   const style = [
     '---',
