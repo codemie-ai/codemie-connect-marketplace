@@ -1,0 +1,15 @@
+{
+  "id": "knowledge", "name": "Knowledge", "version": "1.0.0", "engine": ">=1.0",
+  "requires": ["reply_context_provider"], "provides": ["reply-context"],
+  "main": "main.js", "client": "client.js", "icon": "icon.svg",
+  "summary": "Your voice for Connect's reply drafts, kept as Markdown in a folder you choose: people, a style card from your sent messages, your instructions, and facts from your notes",
+  "uses": { "folders": { "what": "knowledge folder", "write": true }, "claude": {} },
+  "settings": [
+    { "key": "peopleFolder", "label": "People folder", "type": "string", "default": "People" },
+    { "key": "voiceFolder", "label": "Voice folder", "type": "string", "default": "Voice" },
+    { "key": "ownerPage", "label": "Your own page", "type": "string", "default": "" },
+    { "key": "profileSections", "label": "Sections on how to write to someone, best first", "type": "string",
+      "default": "Writing to them, Anti-patterns (do not write), Communication Style, Communication Preferences, Example Exchange, Speech Acts, Shared Shorthand, Vocabulary Cues, Communication Notes" },
+    { "key": "aboutSections", "label": "Sections about the person", "type": "string",
+      "default": "Overview, Snapshot, Roles And Background, Affiliations And Roles, Working Style, Priorities" } ]
+}
