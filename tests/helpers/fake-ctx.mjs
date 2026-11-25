@@ -43,7 +43,9 @@ export function fakeCtx({
   const commands = {}; // ctx.command (a page's own host commands, called through ctx.call)
   const claudeCalls = [];
   const clock = { value: now ?? Date.UTC(2026, 10, 25) };
-  const mtimes = new Map(); // relative, '/'-separated path -> ms, for files this ctx wrote
+  const mtimes = new Map(); // relative, '/'-separated path -> ms (the clock's own unit), for
+  // files this ctx wrote; `statOf`/`walkFiles` convert to seconds before handing it to a plugin
+  // (review I2: the real host's `fs.rs` `mtime_of` answers seconds since 1970, not milliseconds).
 
   const root = dir ?? mkdtempSync(join(tmpdir(), 'connect-plugin-'));
   const toAbs = (rel) => join(root, rel ?? '');
@@ -57,7 +59,7 @@ export function fakeCtx({
     return {
       kind,
       size: kind === 'file' ? st.size : 0,
-      mtime: mtimes.get(rel) ?? Math.floor(st.mtimeMs),
+      mtime: Math.floor((mtimes.get(rel) ?? st.mtimeMs) / 1000),
       real: rel,
     };
   }
@@ -87,7 +89,7 @@ export function fakeCtx({
           const fileExt = extname(rel).slice(1).toLowerCase();
           if (extSet.size && !extSet.has(fileExt)) continue;
           const st = statSync(abs);
-          out.push({ path: rel, size: st.size, mtime: mtimes.get(rel) ?? Math.floor(st.mtimeMs) });
+          out.push({ path: rel, size: st.size, mtime: Math.floor((mtimes.get(rel) ?? st.mtimeMs) / 1000) });
         }
       }
       for (const d of dirs) visit(d);

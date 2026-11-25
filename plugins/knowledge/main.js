@@ -448,16 +448,49 @@ const FACTS_FILE_MAX = 200 * 1024;
 const FACTS_BUDGET_MS = 2500;
 const FACTS_ANSWER_MAX = 5;
 
+// Bookkeeping files in Knowledge's own plugin-data store (`ctx.store`) — never in the user's
+// folder, never shown as a setting: which root is "the" chosen folder (review I5), and the
+// remembered "Ask AI" checkbox (spec §8: "off until ticked, remembered").
+const ROOT_FILE = 'root.json';
+const PREFS_FILE = 'prefs.json';
+
 function setting(ctx, key, fallback) {
   const v = ctx.settings.get(key);
   return typeof v === 'string' && v.trim() ? v.trim() : fallback;
 }
 
-// The granted folder Knowledge reads and writes: the most recently chosen one (`ctx.fs.folders()`
-// never forgets an earlier grant on its own), or `null` when none was ever chosen.
-function rootOf(ctx) {
+// Reads the remembered "Ask AI" checkbox (spec §8); `false` until the user ever ticks it.
+function readAskAi(ctx) {
+  return Boolean(readJsonFile(ctx, PREFS_FILE, {}).buildWithAi);
+}
+
+function writeAskAi(ctx, value) {
+  ctx.store.write(PREFS_FILE, JSON.stringify({ buildWithAi: Boolean(value) }));
+}
+
+function readJsonFile(ctx, file, fallback) {
+  try {
+    const raw = ctx.store.read(file);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// The folder Knowledge reads and writes: the one the user last picked through `pickFolder`
+// (remembered in `ctx.store`, review I5), as long as it is still among the granted roots —
+// `ctx.fs.folders()` never forgets an earlier grant, or reorders them, so picking A, then B,
+// then A again leaves `ctx.fs.folders()` as `[A, B]` and only this remembered value tells the
+// two apart. Falls back to the most recently *granted* root (the old behaviour) when nothing was
+// ever remembered, or the remembered one is no longer granted; `null` when none was ever chosen.
+export function rootOf(ctx) {
   const folders = ctx.fs.folders() || [];
-  return folders.length ? folders[folders.length - 1] : null;
+  if (!folders.length) return null;
+  const remembered = readJsonFile(ctx, ROOT_FILE, null)?.root;
+  if (typeof remembered === 'string' && folders.includes(remembered)) return remembered;
+  return folders[folders.length - 1];
 }
 
 // No folder chosen -> `needs_setup`, as every op that needs the folder throws it (design §1,
@@ -576,7 +609,9 @@ async function fullStyleAndRules(ctx, root, entries) {
   let updatedAt = null;
   if (styleRel) {
     const st = await ctx.fs.stat(root, styleRel);
-    if (st && st.kind === 'file') updatedAt = new Date(st.mtime).toISOString();
+    // `fs.rs`'s `mtime_of` answers seconds since 1970, not milliseconds (review I2): treating it
+    // as milliseconds showed every style card as updated in January 1970.
+    if (st && st.kind === 'file') updatedAt = new Date(st.mtime * 1000).toISOString();
   }
   const fullStyle = {
     text: style.text,
@@ -771,18 +806,34 @@ export function scorePage(page, terms) {
   return { score, distinct, updatedAt: (front.updated_at ?? front.updated) || null };
 }
 
+// Cuts `s` to at most `max` characters, no ellipsis — Connect's own `facts.rs` cuts a fact's
+// `title` the same plain way (unlike `text`, which gets `cut()`'s line-end-and-"…" treatment).
+function cutChars(s, max) {
+  const str = String(s ?? '');
+  return str.length <= max ? str : str.slice(0, max);
+}
+
 /**
  * `snippetOf({path, text}, terms)`: the page's H1 (else its slugged file name, title-cased) as
- * `title`; `text` the lines holding a term, each with its nearest "## " heading, frontmatter
- * removed and `[[links]]` read as text, cut to 500 characters (design §10's "The answer and its
- * limits").
+ * `title` (cut to 120 characters, as Connect's own `facts.rs` would cut it anyway); `text` the
+ * lines holding a term, each with its nearest "## " heading, frontmatter removed and
+ * `[[links]]` read as text, cut to 500 characters (design §10's "The answer and its limits").
+ *
+ * A page can score (design §10's 5/3 weights) purely on its H1, an alias, a "## " heading's own
+ * text, or a frontmatter value, with no term anywhere in its body — review I3: such a page must
+ * still give *some* useful text (Connect's `facts.rs` `from_answer` drops any fact with empty
+ * text outright, so an empty snippet silently loses that page's slot to nothing). When no body
+ * line holds a term, this falls back to the matched "## " heading's own first lines, or, failing
+ * that, the body's first non-heading lines — never an empty string while the page has any text
+ * at all.
  */
 export function snippetOf(page, terms) {
   const raw = String(page?.text ?? '');
   const { body } = parseFrontmatter(raw);
   const h1 = h1Of(body);
-  const title = h1 || titleCaseOf(slug(baseNameOf(page?.path ?? '')));
+  const title = cutChars(h1 || titleCaseOf(slug(baseNameOf(page?.path ?? ''))), 120);
   const termsFolded = (terms ?? []).map(foldText).filter(Boolean);
+  const sections = sectionsOf(body);
   const lines = stripLinks(body).split(/\r\n|\n/);
   let heading = null;
   let lastEmitted = null;
@@ -804,6 +855,18 @@ export function snippetOf(page, terms) {
       out.push(line);
     }
   }
+  if (out.length === 0) {
+    const headingHit = sections.find((s) => termsFolded.some((t) => wordIncludes(foldText(s.heading), t)));
+    if (headingHit) {
+      out.push(`## ${headingHit.heading}`);
+      out.push(...stripLinks(headingHit.text).split(/\r\n|\n/).map((l) => l.trim()).filter(Boolean).slice(0, 3));
+    } else {
+      out.push(...stripLinks(body).split(/\r\n|\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !/^#{1,6}\s/.test(l))
+        .slice(0, 3));
+    }
+  }
   const text = cut(out.join('\n').trim(), 500);
   return { title, text };
 }
@@ -811,6 +874,11 @@ export function snippetOf(page, terms) {
 // The `facts` op itself: the walk, the scoring, the 2.5 s budget and the top-5 ranking (design
 // §10).
 async function searchFacts(ctx, root, entries, args) {
+  // The deadline starts here, before the walk or the personId lookup (Minor: a large folder's
+  // walk, or up to 2,000 people pages read to resolve `personId`, must count against the 2.5 s
+  // budget too, not just the scoring loop after them).
+  const deadline = Date.now() + FACTS_BUDGET_MS;
+
   const terms = Array.isArray(args?.terms)
     ? args.terms.map((t) => String(t ?? '').trim()).filter(Boolean)
     : [];
@@ -823,6 +891,8 @@ async function searchFacts(ctx, root, entries, args) {
     if (match) excludePath = match.source;
   }
 
+  if (Date.now() > deadline) return { facts: [] };
+
   const files = (await ctx.fs.walk(root, {})) ?? [];
   const candidates = [];
   for (const f of files.slice(0, FACTS_WALK_MAX)) {
@@ -833,7 +903,6 @@ async function searchFacts(ctx, root, entries, args) {
     candidates.push(f);
   }
 
-  const deadline = Date.now() + FACTS_BUDGET_MS;
   const scored = [];
   for (const f of candidates) {
     if (Date.now() > deadline) break;
@@ -852,12 +921,17 @@ async function searchFacts(ctx, root, entries, args) {
     return bt - at;
   });
 
-  const out = scored.slice(0, FACTS_ANSWER_MAX).map((p) => {
+  // Review I3: a page with no usable snippet text (Connect's own `facts.rs` would drop it
+  // anyway) never takes one of the 5 slots — the next-ranked, populated page does instead.
+  const out = [];
+  for (const p of scored) {
+    if (out.length >= FACTS_ANSWER_MAX) break;
     const snip = snippetOf({ path: p.path, text: p.text }, terms);
+    if (!snip.text) continue;
     const fact = { id: p.path, title: snip.title, text: snip.text };
     if (p.updatedAt) fact.updatedAt = p.updatedAt;
-    return fact;
-  });
+    out.push(fact);
+  }
   return { facts: out };
 }
 
@@ -978,10 +1052,37 @@ export function styleFacts(messages) {
   return { mail: statsOf(mailMsgs), teams: statsOf(teamsMsgs), languages };
 }
 
+// A whole-word, case-insensitive replace (review I4): `word` must sit between two
+// non-letter-or-digit characters (or the ends), via zero-width look-around so nothing needs
+// reconstructing — the same boundary rule `wordIncludes` already uses for facts terms, here so a
+// short name like "Al" never corrupts "Also" into "the recipientso".
+function replaceWholeWord(text, word, replacement) {
+  if (!word) return text;
+  const re = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegex(word)}(?![\\p{L}\\p{N}])`, 'giu');
+  return text.replace(re, replacement);
+}
+
+// Every string worth matching against a `to` field: the full name(s) as given, and each of
+// their words of 2 or more letters (so "Hi Priya," matches on the first name alone, not only the
+// full display name "Priya Nair") — longest first, so a full name is tried whole before its
+// parts (review I4: greetings and mentions normally use the first name).
+function recipientCandidates(toField) {
+  const names = String(toField ?? '').split(',').map((n) => n.trim()).filter(Boolean);
+  const set = new Set();
+  for (const name of names) {
+    if (name) set.add(name);
+    for (const w of name.split(/\s+/)) {
+      if (w.length >= 2) set.add(w);
+    }
+  }
+  return [...set].sort((a, b) => b.length - a.length);
+}
+
 /**
  * `aiSamples(messages)`: at most 40 of `messages`, newest first (the order `sent` already gives),
  * each cut to 1,500 characters with e-mail addresses and phone numbers removed and every name in
- * `to` replaced by "the recipient" (design §8 step 3) -> `[{channel, text}]`.
+ * `to` — the full name and each of its words, whole-word and case-insensitive — replaced by "the
+ * recipient" (design §8 step 3) -> `[{channel, text}]`.
  */
 export function aiSamples(messages) {
   const list = Array.isArray(messages) ? messages : [];
@@ -990,11 +1091,10 @@ export function aiSamples(messages) {
     if (out.length >= 40) break;
     let text = String(m?.text ?? '');
     if (!text.trim()) continue;
-    const names = String(m?.to ?? '').split(',').map((n) => n.trim()).filter(Boolean);
-    for (const name of names) {
-      text = text.replaceAll(name, 'the recipient');
+    for (const candidate of recipientCandidates(m?.to)) {
+      text = replaceWholeWord(text, candidate, 'the recipient');
     }
-    text = text.replace(EMAIL_RE, '').replace(PHONE_RE, '');
+    text = text.replace(EMAIL_RE, '').replace(PHONE_RE, (match) => (/^\d{4}-\d{2}-\d{2}$/.test(match) ? match : ''));
     text = cut(text.trim(), 1500);
     if (!text) continue;
     out.push({ channel: m?.channel === 'mail' ? 'mail' : 'teams', text });
@@ -1023,6 +1123,14 @@ function buildAiPrompt(samples) {
   ].join('\n');
 }
 
+// Caps the AI's "## In words" answer to at most 12 lines and 1,500 characters (the prompt already
+// asks for 12 short lines; this is the backstop so one unruly answer can't push the whole style
+// card toward its own 8,000-character limit).
+function capWords(answer) {
+  const lines = String(answer ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 12);
+  return cut(lines.join('\n').trim(), 1500);
+}
+
 async function buildImpl(ctx, args = {}) {
   const root = requireRoot(ctx);
   const entries = await listDirsOrThrow(ctx, root);
@@ -1036,9 +1144,15 @@ async function buildImpl(ctx, args = {}) {
     ? { front: {}, body: '' }
     : parseFrontmatter(current);
   const recordedBuilt = front && front.built ? String(front.built) : null;
-  const bodySha = current !== null && front !== null ? ctx.crypto.sha256(String(currentBody).trim()) : null;
+  const bodyNonEmpty = current !== null && front !== null && String(currentBody).trim() !== '';
+  const bodySha = bodyNonEmpty ? ctx.crypto.sha256(String(currentBody).trim()) : null;
 
-  if (recordedBuilt && bodySha && recordedBuilt !== bodySha && !args.replace) {
+  // Review I1: a card is "the one Build itself last wrote" only when its body's sha matches the
+  // recorded `built` — a hand-written card, or one saved through Connect's own `save
+  // {kind:"style"}` before any Build ever ran (`saveStyleImpl` writes no `built`), has no
+  // recorded sha at all and must still be asked about, not silently replaced.
+  const changedSinceBuild = bodyNonEmpty && (!recordedBuilt || bodySha !== recordedBuilt);
+  if (changedSinceBuild && !args.replace) {
     return { ask: 'Replace the style card you edited?' };
   }
 
@@ -1066,7 +1180,7 @@ async function buildImpl(ctx, args = {}) {
   if (args.ai) {
     const samples = aiSamples(list);
     const answer = await ctx.claude.run({ prompt: buildAiPrompt(samples), title: 'Knowledge: how you write' });
-    const words = String(answer?.answer ?? '').trim();
+    const words = capWords(answer?.answer);
     if (words) sections.push(`## In words\n\n${words}`);
   }
 
@@ -1122,6 +1236,13 @@ async function saveRuleImpl(ctx, root, entries, args) {
   const ids = idsOfBlocks(blocks);
   const heading = headingOf(args.applies);
   const newLines = String(args.text ?? '').trim().split(/\r\n|\n/);
+
+  // An id that doesn't match any current block — a rule deleted in the folder meanwhile — is
+  // refused, never silently turned into a new rule (Minor: a stale edit must not resurrect a
+  // removed instruction under a different id).
+  if (args.id && !ids.includes(args.id)) {
+    throw new Error('refused: This instruction is no longer there. Refresh and try again.');
+  }
 
   const nextBlocks = blocks.map((b) => ({ heading: b.heading, lines: b.lines.slice() }));
   let targetIndex = args.id ? ids.findIndex((rid) => rid === args.id) : -1;
@@ -1220,12 +1341,13 @@ async function newPersonImpl(ctx, root, entries, args) {
 
 async function summaryImpl(ctx) {
   const root = rootOf(ctx);
-  if (!root) return { folder: null, people: 0, peopleWithProfile: 0, rules: 0, style: false };
+  const buildWithAi = readAskAi(ctx);
+  if (!root) return { folder: null, people: 0, peopleWithProfile: 0, rules: 0, style: false, buildWithAi };
   let entries;
   try {
     entries = await ctx.fs.list(root, '');
   } catch {
-    return { folder: root, people: 0, peopleWithProfile: 0, rules: 0, style: false };
+    return { folder: root, people: 0, peopleWithProfile: 0, rules: 0, style: false, buildWithAi };
   }
   const { people } = await readAllPeople(ctx, root, entries);
   const full = await fullStyleAndRules(ctx, root, entries);
@@ -1235,6 +1357,7 @@ async function summaryImpl(ctx) {
     peopleWithProfile: people.filter((p) => p.text).length,
     rules: full.rules.length,
     style: Boolean(full.style.text),
+    buildWithAi,
   };
 }
 
@@ -1305,9 +1428,21 @@ export function apply(ctx) {
     return summaryImpl(ctx);
   }
 
+  // Remembers the chosen root explicitly (review I5): `ctx.fs.folders()` only ever grows, and
+  // never reorders, so re-picking an earlier folder would otherwise leave Knowledge reading and
+  // writing whichever one was granted last, not the one just chosen.
   async function pickFolder() {
     const chosen = await ctx.system.pickFolder('Choose your knowledge folder');
+    if (chosen) ctx.store.write(ROOT_FILE, JSON.stringify({ root: chosen }));
     return { folder: chosen ?? null };
+  }
+
+  // The "Ask AI" checkbox is remembered across page loads (spec §8: "off until ticked,
+  // remembered"), in Knowledge's own plugin-data store — never a manifest setting, since it is
+  // Knowledge's own page's preference, not one of Settings › Your voice's rows.
+  async function setAskAi(args = {}) {
+    writeAskAi(ctx, args?.value);
+    return { buildWithAi: readAskAi(ctx) };
   }
 
   ctx.replyContext.provide({ status, export: doExport, context, facts, save, remove });
@@ -1315,4 +1450,5 @@ export function apply(ctx) {
   ctx.command('build', build);
   ctx.command('newPerson', newPerson);
   ctx.command('summary', summary);
+  ctx.command('setAskAi', setAskAi);
 }

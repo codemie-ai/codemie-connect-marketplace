@@ -97,6 +97,53 @@ test('snippetOf: the H1 as title, lines holding a term with their nearest headin
   assert.ok(long.text.endsWith('…'));
 });
 
+// Review I3: a page that matches only in an alias, a "## " heading or frontmatter — never in a
+// body line — must still give useful text (Connect's `facts.rs` `from_answer` drops any fact
+// whose text is empty outright). The title is also cut to 120, as Connect would cut it anyway.
+test('snippetOf falls back to the matched heading’s own lines, or the body’s first lines, when no body line holds the term', () => {
+  const aliasOnly = {
+    path: 'projects/qbr.md',
+    text: ['---', 'aliases: [QBR]', '---', '# Quarterly review', 'How it went this quarter.', 'Nothing names it directly.'].join('\n'),
+  };
+  const byAlias = snippetOf(aliasOnly, ['QBR']);
+  assert.equal(byAlias.title, 'Quarterly review');
+  assert.notEqual(byAlias.text, '', 'an alias-only match still gives text');
+  assert.ok(byAlias.text.includes('How it went this quarter.'));
+
+  const headingOnly = {
+    path: 'projects/sow.md',
+    text: ['# Statement of work', '## SOW-77', 'Signed in May.', 'Renews every year.'].join('\n'),
+  };
+  const byHeading = snippetOf(headingOnly, ['SOW-77']);
+  assert.notEqual(byHeading.text, '');
+  assert.ok(byHeading.text.includes('## SOW-77'));
+  assert.ok(byHeading.text.includes('Signed in May.'), 'the matched heading’s own first lines stand in for a body hit');
+
+  const frontmatterOnly = {
+    path: 'projects/budget.md',
+    text: ['---', 'tags: [budget]', '---', '# Spend tracker', 'Tracking the quarter’s spend.'].join('\n'),
+  };
+  const byFrontmatter = snippetOf(frontmatterOnly, ['budget']);
+  assert.notEqual(byFrontmatter.text, '');
+  assert.ok(byFrontmatter.text.includes('Spend tracker') || byFrontmatter.text.includes('Tracking'));
+
+  const longTitle = snippetOf({ path: 'p.md', text: `# ${'Word '.repeat(40)}\nBody.` }, ['Word']);
+  assert.ok(longTitle.title.length <= 120);
+});
+
+// Review I3's own suggested fix: when a page truly has no text to give (an alias-only match on
+// an otherwise-empty page), it is skipped rather than handed back as an empty fact — a
+// lower-ranked, populated page takes its slot instead.
+test('facts skips a page with no usable snippet text, letting a lower-ranked page take its slot', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-facts-empty-'));
+  write(dir, 'people/ghost.md', '---\naliases: [QBR]\n---\n');
+  write(dir, 'notes/real.md', '# Notes\nMentions QBR in passing, with real detail to read.');
+  const { run } = setup(dir);
+  const answer = await run('facts', { terms: ['QBR'], personId: null });
+  assert.ok(answer.facts.every((f) => f.text), 'no fact is ever answered with empty text');
+  assert.ok(answer.facts.some((f) => f.id === 'notes/real.md'));
+});
+
 test('facts ranks pages by the §10 scores and answers at most 5 snippets of ≤ 500 with page ids and titles', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'knowledge-facts-rank-'));
   write(dir, 'projects/atlas-rollout.md', '# Atlas rollout\nTracking EPM-1234 this sprint.');
@@ -152,7 +199,9 @@ test('facts stops at 2.5 s and answers what it has', async () => {
   const { run } = setup(dir);
 
   const base = 1_700_000_000_000;
-  const sequence = [base, base + 500, base + 1000, base + 1500, base + 3000, base + 3500];
+  // One call establishes the deadline, one more checks it right after resolving `personId`
+  // (none here, but the check always runs), then one per candidate scored.
+  const sequence = [base, base + 200, base + 500, base + 1000, base + 1500, base + 3000, base + 3500];
   let i = 0;
   const realNow = Date.now;
   Date.now = () => sequence[Math.min(i++, sequence.length - 1)];

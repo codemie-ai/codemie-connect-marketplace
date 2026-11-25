@@ -78,6 +78,20 @@ test('aiSamples skips a message with no text and never exceeds 40', () => {
   assert.equal(samples.length, 40);
 });
 
+// Review I4: greetings and mentions normally use the first name, not the full display name, so
+// the first-name case must be covered on its own, not only the exact "Priya Nair" phrase.
+test('aiSamples replaces a recipient by first name alone, whole-word and case-insensitive', () => {
+  const [sample] = aiSamples([{ channel: 'mail', text: 'Hi Priya, see you then. priya said yes.', to: 'Priya Nair' }]);
+  assert.equal(sample.text, 'Hi the recipient, see you then. the recipient said yes.');
+});
+
+// Review I4: a short name must never corrupt an unrelated word it happens to be a substring of —
+// `replaceAll` with no word boundary turned "Also" into "the recipientso".
+test('aiSamples never corrupts "Also" when the recipient is named "Al"', () => {
+  const [sample] = aiSamples([{ channel: 'mail', text: 'Also, thanks for the help, Al.', to: 'Al' }]);
+  assert.equal(sample.text, 'Also, thanks for the help, the recipient.');
+});
+
 test('build without AI writes Voice/style.md with ## Mail, ## Teams and a language section for ≥ 5 messages, basedOn {mail, teams}, and runs no claude', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'knowledge-build-'));
   const mail = Array.from({ length: 12 }, (_, i) => ({ channel: 'mail', text: `Hi, message number ${i}.`, to: 'Priya' }));
@@ -150,6 +164,46 @@ test('build asks before replacing a style card the user edited', async () => {
   assert.equal(replaced.ask, undefined);
   const final = readFileSync(join(dir, 'Voice', 'style.md'), 'utf8');
   assert.ok(!final.includes('Hand-edited.'), 'replace: true writes over the edited card');
+});
+
+// Review I1: a card with no `built` field at all — written entirely by hand, or saved through
+// Connect's own `save {kind:"style"}` before any Build ever ran — must also be asked about, not
+// silently replaced; `recordedBuilt` being absent is not the same as "nothing to protect".
+test('build asks before replacing a hand-written card that has never been through Build', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-build-handwritten-'));
+  mkdirSync(join(dir, 'Voice'), { recursive: true });
+  writeFileSync(join(dir, 'Voice', 'style.md'), 'My own hand-written card.');
+  const { ctx, run } = setup({ dir, sent: [{ channel: 'mail', text: 'Hi.', to: 'X' }] });
+
+  const answer = await run('build', {});
+  assert.equal(answer.ask, 'Replace the style card you edited?');
+  assert.equal(ctx._claudeCalls.length, 0);
+  assert.equal(readFileSync(join(dir, 'Voice', 'style.md'), 'utf8'), 'My own hand-written card.', 'nothing was overwritten');
+
+  const replaced = await run('build', { replace: true });
+  assert.equal(replaced.ask, undefined);
+  assert.ok(!readFileSync(join(dir, 'Voice', 'style.md'), 'utf8').includes('hand-written'));
+});
+
+// Same gap, reached through `save {kind:"style"}` instead of a hand edit: Connect's own save
+// path writes no `built` either.
+test('build asks before replacing a card saved through Connect before any Build', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-build-saved-'));
+  const { ctx, run } = setup({ dir, sent: [{ channel: 'mail', text: 'Hi.', to: 'X' }] });
+  await run('save', { kind: 'style', text: 'Written through Settings › Your voice.' });
+
+  const answer = await run('build', {});
+  assert.equal(answer.ask, 'Replace the style card you edited?');
+  assert.equal(ctx._claudeCalls.length, 0);
+  assert.ok(readFileSync(join(dir, 'Voice', 'style.md'), 'utf8').includes('Written through Settings'));
+});
+
+test('build does not ask again when the card still matches what Build itself last wrote', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-build-unchanged-'));
+  const { run } = setup({ dir, sent: [{ channel: 'mail', text: 'Hi.', to: 'X' }] });
+  await run('build', {});
+  const again = await run('build', {});
+  assert.equal(again.ask, undefined, 'nothing changed the card between the two presses');
 });
 
 test('build with no sent messages at all writes a thin, empty-handed card', async () => {

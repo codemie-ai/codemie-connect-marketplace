@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { apply } from '../../plugins/knowledge/main.js';
+import { apply, rootOf } from '../../plugins/knowledge/main.js';
 import { fakeCtx } from '../helpers/fake-ctx.mjs';
 
 const SENTINEL = 'VOICE_SENTINEL_9f3a';
@@ -105,6 +105,25 @@ test('export lists the style card with its head, the rules and the people; a bro
   assert.equal(exported.rules[0].editable, true);
   assert.equal(exported.people.length, 2);
   assert.ok(exported.people.some((p) => p.name === 'Priya N.'));
+});
+
+// Review I2: the real host's `fs.rs` `mtime_of` answers seconds since 1970, not milliseconds.
+// `fullStyleAndRules` must multiply by 1000 before building a Date, and the fake must hand back
+// seconds too, or this test would pass against a fake that quietly disagrees with the host.
+test('export reads style.updatedAt from the file’s mtime in seconds, not milliseconds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-mtime-'));
+  write(dir, 'Voice/style.md', 'Keep replies short.');
+  const { run } = setup({ dir });
+
+  const fsMod = await import('node:fs');
+  const expectedSeconds = Math.floor(fsMod.statSync(join(dir, 'Voice', 'style.md')).mtimeMs / 1000);
+  const exported = await run('export', {});
+  const gotSeconds = Math.floor(new Date(exported.style.updatedAt).getTime() / 1000);
+  assert.equal(gotSeconds, expectedSeconds);
+  assert.ok(
+    new Date(exported.style.updatedAt).getUTCFullYear() > 2000,
+    `expected a real date, got ${exported.style.updatedAt} (an mtime treated as milliseconds would land in January 1970)`,
+  );
 });
 
 test('context answers what applies to one person (by address, Teams id or name) and leaves out the rest', async () => {
@@ -223,6 +242,25 @@ test('remove deletes a rule section; removing one already gone answers removed',
   assert.deepEqual(again, { removed: true }, 'removing an already-gone rule still answers removed');
 });
 
+// Every file under `dir`, relative, '/'-separated, sorted — so a test can assert the whole tree,
+// not just that the expected files happen to exist (Minor: the old version of this test never
+// proved nothing *else* was written).
+async function listTree(dir) {
+  const fsMod = await import('node:fs');
+  const pathMod = await import('node:path');
+  const out = [];
+  const visit = (abs, rel) => {
+    for (const name of fsMod.readdirSync(abs)) {
+      const childAbs = pathMod.join(abs, name);
+      const childRel = rel ? `${rel}/${name}` : name;
+      if (fsMod.statSync(childAbs).isDirectory()) visit(childAbs, childRel);
+      else out.push(childRel);
+    }
+  };
+  visit(dir, '');
+  return out.sort();
+}
+
 test('no write lands outside the Voice folder except a new person page; .git is never touched', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'knowledge-scope-'));
   write(dir, '.git/config', 'ignore me');
@@ -234,9 +272,62 @@ test('no write lands outside the Voice folder except a new person page; .git is 
 
   const fsMod = await import('node:fs');
   assert.equal(fsMod.readFileSync(join(dir, '.git', 'config'), 'utf8'), 'ignore me');
-  assert.ok(fsMod.existsSync(join(dir, 'Voice', 'style.md')));
-  assert.ok(fsMod.existsSync(join(dir, 'Voice', 'rules.md')));
-  assert.ok(fsMod.existsSync(join(dir, 'People', 'jordan-lee.md')));
+  assert.deepEqual(
+    await listTree(dir),
+    ['.git/config', 'People/jordan-lee.md', 'Voice/rules.md', 'Voice/style.md'],
+    'exactly these files, nothing else, were written',
+  );
+});
+
+// Review I5: `ctx.fs.folders()` only ever grows and never reorders, so after choosing A, then B,
+// then A again, it still answers `[A, B]` — the last-granted root alone can't tell which one the
+// user actually wants now.
+test('rootOf prefers the explicitly remembered root over the last-granted one', () => {
+  const stub = {
+    fs: { folders: () => ['/path/A', '/path/B'] },
+    store: { read: (file) => (file === 'root.json' ? JSON.stringify({ root: '/path/A' }) : null) },
+  };
+  assert.equal(rootOf(stub), '/path/A', 'A was explicitly remembered, even though B was granted later');
+
+  const forgotten = {
+    fs: { folders: () => ['/path/A', '/path/B'] },
+    store: { read: () => null },
+  };
+  assert.equal(rootOf(forgotten), '/path/B', 'nothing remembered: falls back to the last grant');
+
+  const stale = {
+    fs: { folders: () => ['/path/B'] },
+    store: { read: () => JSON.stringify({ root: '/path/A' }) },
+  };
+  assert.equal(rootOf(stale), '/path/B', 'a remembered root no longer granted is ignored');
+});
+
+test('after choosing A, then B, then A again, pickFolder remembers A as the chosen root', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-repick-'));
+  const ctx = fakeCtx({ dir });
+  apply(ctx);
+
+  ctx.system.pickFolder = async () => '/path/A';
+  await ctx.run('pickFolder', {});
+  ctx.system.pickFolder = async () => '/path/B';
+  await ctx.run('pickFolder', {});
+  ctx.system.pickFolder = async () => '/path/A';
+  await ctx.run('pickFolder', {});
+
+  assert.deepEqual(JSON.parse(ctx.store.read('root.json')), { root: '/path/A' });
+});
+
+// Spec gap from the review: "Ask AI ... (off until ticked, remembered)".
+test('"Ask AI" is remembered across page loads, through setAskAi and summary', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'knowledge-askai-'));
+  const { run } = setup({ dir });
+
+  assert.equal((await run('summary', {})).buildWithAi, false, 'off until ticked');
+  await run('setAskAi', { value: true });
+  assert.equal((await run('summary', {})).buildWithAi, true, 'remembered after being ticked');
+
+  await run('setAskAi', { value: false });
+  assert.equal((await run('summary', {})).buildWithAi, false);
 });
 
 test('no error message carries page text', async () => {
