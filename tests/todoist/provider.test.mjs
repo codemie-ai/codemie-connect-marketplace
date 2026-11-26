@@ -156,8 +156,8 @@ test('add, remove, add again in quick succession makes a new task, never the del
   assert.equal((await run('list', {})).tasks.length, 1, 'one open task in Todoist');
 });
 
-test('list answers every open task of the project, paged', async () => {
-  const { run, fake } = setup({ todoist: { pageSize: 2 } });
+test('with Show = project, list answers every open task of the project, paged', async () => {
+  const { run, fake } = setup({ settings: { scope: 'project' }, todoist: { pageSize: 2 } });
   for (const n of [1, 2, 3, 4, 5]) await run('create', { key: `k${n}`, task: { text: `T${n}`, labels: [] }, requestId: `r${n}` });
   const other = fake.addProject('Elsewhere');
   await fake.handler('https://api.todoist.com/api/v1/tasks', {
@@ -167,8 +167,8 @@ test('list answers every open task of the project, paged', async () => {
   assert.deepEqual(tasks.map((t) => t.text).sort(), ['T1', 'T2', 'T3', 'T4', 'T5']);
 });
 
-test('changedSince returns changed, done and removed tasks of the project only', async () => {
-  const { run, fake } = setup();
+test('with Show = project, changedSince returns changed, done and removed tasks of the project only', async () => {
+  const { run, fake } = setup({ settings: { scope: 'project' } });
   const a = await run('create', { key: 'ka', task: { text: 'A', labels: [] }, requestId: 'ra' });
   const b = await run('create', { key: 'kb', task: { text: 'B', labels: [] }, requestId: 'rb' });
   const c = await run('create', { key: 'kc', task: { text: 'C', labels: [] }, requestId: 'rc' });
@@ -424,4 +424,112 @@ test('the key index learns from changedSince, so a task made elsewhere is adopte
   const again = await run('create', { key: 'k9', task: { text: 'Same', labels: [] }, requestId: 'r9' });
   assert.equal(again.adopted, true);
   assert.equal(again.id, JSON.parse(other.body).id);
+});
+
+// ---------------------------------------------------------------- Show: all projects (1.1.0)
+
+// A task made in Todoist itself (not by Connect) in project `projectId`.
+async function addInTodoist(fake, fields) {
+  const res = await fake.handler('https://api.todoist.com/api/v1/tasks', {
+    method: 'POST', headers: { Authorization: `Bearer ${SENTINEL}` }, body: JSON.stringify(fields),
+  });
+  return JSON.parse(res.body);
+}
+
+test('by default list answers the open tasks of every project, Inbox included, paged', async () => {
+  const { run, fake } = setup({ todoist: { pageSize: 2 } });
+  await run('create', { key: 'k1', task: { text: 'Ours', labels: [] }, requestId: 'r1' });
+  const inbox = fake.addProject('Inbox');
+  const work = fake.addProject('Work');
+  const home = fake.addProject('Home');
+  await addInTodoist(fake, { content: 'In the Inbox', project_id: inbox.id });
+  await addInTodoist(fake, { content: 'Work one', project_id: work.id });
+  await addInTodoist(fake, { content: 'Work two', project_id: work.id, labels: ['reply'] });
+  await addInTodoist(fake, { content: 'At home', project_id: home.id });
+  const done = await addInTodoist(fake, { content: 'Done already', project_id: home.id });
+  fake.edit(done.id, { checked: true });
+
+  const { tasks } = await run('list', {});
+  assert.deepEqual(tasks.map((t) => t.text).sort(), ['At home', 'In the Inbox', 'Ours', 'Work one', 'Work two']);
+  const lists = fake.requests.filter((r) => r.method === 'GET' && r.path.startsWith('/tasks?'));
+  const last = lists.slice(-3);
+  assert.equal(last.length, 3, 'five tasks over pages of two');
+  for (const r of last) assert.doesNotMatch(r.path, /project_id/);
+  // Foreign tasks read as plain tasks: kind from their labels, no key, nothing Connect's.
+  const reply = tasks.find((t) => t.text === 'Work two');
+  assert.equal(reply.kind, 'reply');
+  assert.equal(reply.key, undefined);
+  assert.equal(tasks.find((t) => t.text === 'At home').kind, 'task');
+});
+
+test('by default changedSince syncs items of every project, with no filter', async () => {
+  const { run, fake } = setup();
+  const a = await run('create', { key: 'ka', task: { text: 'A', labels: [] }, requestId: 'ra' });
+  const work = fake.addProject('Work');
+  const w = await addInTodoist(fake, { content: 'Work one', project_id: work.id });
+  const gone = await addInTodoist(fake, { content: 'Soon gone', project_id: work.id });
+
+  const full = await run('changedSince', { cursor: null });
+  assert.deepEqual(full.tasks.map((t) => t.text).sort(), ['A', 'Soon gone', 'Work one']);
+  assert.deepEqual(full.removed, []);
+
+  fake.edit(w.id, { content: 'Work one edited' });
+  fake.edit(a.id, { project_id: work.id });
+  await run('complete', { id: gone.id, done: true });
+  await run('remove', { id: gone.id });
+  const delta = await run('changedSince', { cursor: full.cursor });
+  assert.deepEqual(delta.tasks.map((t) => t.text).sort(), ['A', 'Work one edited'], 'a task moved to another project stays');
+  assert.deepEqual(delta.removed, [gone.id]);
+});
+
+test('with Show = project, list and changedSince leave other projects out', async () => {
+  const { run, fake } = setup({ settings: { scope: 'project' } });
+  await run('create', { key: 'k1', task: { text: 'Ours', labels: [] }, requestId: 'r1' });
+  await addInTodoist(fake, { content: 'In the Inbox', project_id: fake.addProject('Inbox').id });
+  assert.deepEqual((await run('list', {})).tasks.map((t) => t.text), ['Ours']);
+  assert.match(fake.requests.filter((r) => r.path.startsWith('/tasks?')).at(-1).path, /project_id=/);
+  assert.deepEqual((await run('changedSince', { cursor: null })).tasks.map((t) => t.text), ['Ours']);
+});
+
+test('with Show = all, a new task still goes to the Project with its key, labels and date', async () => {
+  const { run, fake, ctx } = setup({ settings: { scope: 'all' } });
+  fake.addProject('Inbox');
+  const made = await run('create', { key: 'k1', task: WAITING, requestId: 'r1' });
+  const pid = JSON.parse(ctx.store.read('project.json')).id;
+  const held = fake.task(made.id);
+  assert.equal(held.project_id, pid);
+  assert.match(held.description, /\nkey: k1\nmeeting: mtg-philips\nowner: /);
+  assert.deepEqual(new Set(held.labels), new Set(['connect', 'waiting']));
+  assert.equal(held.due.date, '2026-11-20');
+});
+
+test('editing a task Connect did not make changes only the edited field', async () => {
+  const { run, fake } = setup();
+  const work = fake.addProject('Work');
+  const desc = 'Call the bank first.\nSource: the paper letter';
+  const t = await addInTodoist(fake, { content: 'Pay the rent', description: desc, project_id: work.id, labels: ['home'] });
+  const writes = () => fake.requests.filter((r) => r.method === 'POST' && r.path === `/tasks/${t.id}`);
+
+  await run('update', { id: t.id, patch: { due: '2026-12-01' }, requestId: 'u1' });
+  assert.deepEqual(JSON.parse(writes().at(-1).body), { due_date: '2026-12-01' });
+  await run('complete', { id: t.id, done: true });
+  await run('complete', { id: t.id, done: false });
+  await run('update', { id: t.id, patch: { text: 'Pay the rent today' }, requestId: 'u2' });
+  assert.deepEqual(JSON.parse(writes().at(-1).body), { content: 'Pay the rent today' });
+
+  let held = fake.task(t.id);
+  assert.deepEqual(held.labels, ['home'], 'no app label');
+  assert.equal(held.description, desc, 'the description is untouched');
+  assert.equal(held.project_id, work.id);
+
+  // A kind change swaps the kind label only: still no app label.
+  await run('update', { id: t.id, patch: { kind: 'reply' }, requestId: 'u3' });
+  held = fake.task(t.id);
+  assert.deepEqual(new Set(held.labels), new Set(['home', 'reply']));
+  assert.equal(held.description, desc);
+  // A notes edit writes the notes, and adds no key line.
+  await run('update', { id: t.id, patch: { notes: 'Call the bank.' }, requestId: 'u4' });
+  held = fake.task(t.id);
+  assert.doesNotMatch(held.description, /key:/);
+  assert.deepEqual(new Set(held.labels), new Set(['home', 'reply']));
 });

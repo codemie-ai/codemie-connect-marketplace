@@ -3,6 +3,8 @@
 // Todoist's: the marker lines in the description, labels, the owner prefix, due dates and error
 // codes. `apply(ctx)` at the end registers the seven provider ops with `ctx.tasks.provide`; they
 // call https://api.todoist.com/api/v1 with the token read from the settings on every call.
+// `list` and `changedSince` cover the open tasks of every project (Show = all, the default) or of
+// the Project only (Show = project); tasks Connect makes always go to the Project.
 
 // The marker-line rule: any line that merely *looks* like one of Connect's marker lines (any
 // case, Markdown-decorated: "**Source:** …", "> key: …") is dropped from free text before it is
@@ -224,6 +226,8 @@ export function apply(ctx) {
   };
   const appLabel = () => setting('label', 'connect');
   const projectName = () => setting('project', 'Connect');
+  // Show: `project` lists and syncs the Project only; anything else, every project.
+  const projectOnly = () => setting('scope', 'all') === 'project';
 
   // One Todoist call. The token is read here, on every call, and kept nowhere else; a failure
   // becomes a coded Error whose message never holds the token or the response body.
@@ -366,13 +370,17 @@ export function apply(ctx) {
   }
 
   async function list() {
+    if (!projectOnly()) return { tasks: (await paged('/tasks')).map(read) };
     return inProject(async (pid) => ({ tasks: (await paged('/tasks', { project_id: pid })).map(read) }));
   }
 
-  // What changed since `cursor` (null: everything open): the project's tasks only, done ones
-  // included, and the ids deleted in Todoist. A task moved to another project is left out.
+  // What changed since `cursor` (null: everything open), done tasks included, and the ids deleted
+  // in Todoist: every project's, or with Show = project the project's only (a task moved to
+  // another project is then left out). With every project shown, the project is not looked up:
+  // the kept id only keeps the create lookup up to date.
   async function changedSince({ cursor = null } = {}) {
-    const pid = await projectId();
+    const only = projectOnly();
+    const pid = only ? await projectId() : keptProject();
     const full = !cursor;
     const answer = await call('POST', '/sync', {
       form: { sync_token: cursor ?? '*', resource_types: JSON.stringify(['items']) },
@@ -381,7 +389,7 @@ export function apply(ctx) {
     const removed = [];
     for (const item of answer?.items ?? []) {
       learn(item, pid);
-      if (String(item.project_id) !== pid) continue;
+      if (only && String(item.project_id) !== pid) continue;
       if (item.is_deleted) {
         if (!full) removed.push(String(item.id));
       } else if (!(full && item.checked)) {
@@ -415,14 +423,16 @@ export function apply(ctx) {
 
   // `patch` holds only the changed fields. The task is read first, so the description is rebuilt
   // with its marker lines, the content keeps or drops the owner prefix, and labels Connect doesn't
-  // own are kept; a field the patch doesn't name is never sent (a recurring due string stays).
+  // own are kept; a field the patch doesn't name is never sent (a recurring due string stays). A
+  // task Connect didn't make (no key line, no app label) never gets the app label.
   async function update({ id, patch = {}, requestId } = {}) {
     const current = read(await call('GET', taskPath(id)));
     const has = (k) => hasOwn(patch, k);
     const merged = { ...current, ...patch };
     if (!has('due')) delete merged.due;
     if (!has('labels')) merged.labels = current.labels;
-    const full = toTodoist(merged, { label: appLabel() });
+    const foreign = !current.key && !current.labels.includes(appLabel());
+    const full = toTodoist(merged, { label: foreign ? undefined : appLabel() });
     const body = {};
     if (has('text') || has('kind') || has('owner')) body.content = full.content;
     if (has('notes') || has('owner')) body.description = full.description;
